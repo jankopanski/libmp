@@ -98,6 +98,7 @@ int mp_deregister(mp_reg_t *reg);
  * \param peer - MPI rank of peer
  */
 int mp_irecv (void *buf, int size, int peer, mp_reg_t *mp_reg, mp_request_t *req);
+int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *mp_reg, mp_request_t *req);
 int mp_isend (void *buf, int size, int peer, mp_reg_t *mp_reg, mp_request_t *req);
 
 int mp_wait (mp_request_t *req);
@@ -114,6 +115,8 @@ int mp_isend_on_stream (void *buf, int size, int peer, mp_reg_t *mp_reg,
                         mp_request_t *req, cudaStream_t stream);
 //int mp_irecv_on_stream (void *buf, int size, int peer, mp_reg_t *mp_reg,
 //                        mp_request_t *req, cudaStream_t stream);
+int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag, 
+                        mp_reg_t *mp_reg, mp_request_t *req, cudaStream_t stream);
 
 /* vector sends/recvs
  * caveats: all blocks are within same registration

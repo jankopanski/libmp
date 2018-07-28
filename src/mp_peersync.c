@@ -464,6 +464,118 @@ out:
     return ret;
 }
 
+int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag, 
+        mp_reg_t *reg_t, mp_request_t *req_t, cudaStream_t stream) {
+    // return mp_isend_on_stream(buf, size, peer, mp_reg, req, stream);
+    int ret = 0;
+    int *tag_buf = NULL;
+    size_t tag_buf_size = sizeof(int);
+    struct mp_request *req = NULL;
+    struct mp_reg *reg = (struct mp_reg *)*reg_t;
+    struct mp_reg *tag_buf_reg = NULL;
+    client_t *client = &clients[client_index[peer]];
+
+    mp_state_t state = use_event_sync ? MP_PREPARED : MP_PENDING_NOWAIT;
+    req = new_stream_request(client, MP_SEND, state, stream);
+    assert(req);
+    mp_dbg_msg("req=%p id=%d\n", req, req->id);
+
+    tag_buf = (int *) malloc(tag_buf_size);
+    if (!tag_buf) {
+        mp_err_msg("cannot allocate memory\n");
+        ret = ENOMEM;
+        goto out;
+    }
+    *tag_buf = tag;
+    ret = mp_register(tag_buf, tag_buf_size, &tag_buf_reg);
+    if (ret) {
+        mp_err_msg("mp_register failed\n");
+        goto cleanup;
+    }
+    req->tag_reg = tag_buf_reg;
+    req->has_tag = true;
+
+    req->in.sr.next = NULL;
+    req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+    req->in.sr.exp_opcode = IBV_EXP_WR_SEND;
+    req->in.sr.wr_id = (uintptr_t) req;
+    req->in.sr.num_sge = 2;
+    req->in.sr.sg_list = req->tag_sg_entry;
+
+    if (mp_enable_ud) {
+        mp_info_msg("UD is not available for tag messages\n");
+        // req->in.sr.wr.ud.ah = client->ah;
+        // req->in.sr.wr.ud.remote_qpn = client->qpn;
+        // req->in.sr.wr.ud.remote_qkey = 0;
+    }
+
+    req->tag_sg_entry[0].length = size;
+    req->tag_sg_entry[0].lkey = reg->key;
+    req->tag_sg_entry[0].addr = (uintptr_t)(buf);
+    req->tag_sg_entry[1].length = tag_buf_size;
+    req->tag_sg_entry[1].lkey = tag_buf_reg->key;
+    req->tag_sg_entry[1].addr = (uintptr_t) tag_buf;
+
+
+    if (use_event_sync) {
+        client->last_posted_trigger_id[mp_type_to_flow(req->type)] = req->id;
+
+#if HAS_GDS_DESCRIPTOR_API
+        size_t n_descs = 0;
+        gds_descriptor_t descs[2];
+        descs[n_descs].tag = GDS_TAG_WRITE_VALUE32;
+        ret = gds_prepare_write_value32(&descs[n_descs].write32,
+                                        &client->last_trigger_id[mp_type_to_flow(req->type)],
+                                        req->id,
+                                        GDS_MEMORY_HOST);
+        ++n_descs;
+        if (ret) {
+            mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
+            // BUG: leaking req ??
+            goto cleanup;
+        }
+        ret = gds_stream_post_descriptors(stream, n_descs, descs, 0);
+#else
+        ret = gds_stream_post_poke_dword(stream, 
+		&client->last_trigger_id[mp_type_to_flow(req->type)], 
+		req->id, 
+		GDS_MEMORY_HOST);
+#endif
+        if (ret) {
+            mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
+            // BUG: leaking req ??
+            goto cleanup;
+        }
+
+        client_track_posted_stream_req(client, req, TX_FLOW);
+    } else {
+        ret = mp_post_send_on_stream(stream, client, req);
+        if (ret) {
+            mp_err_msg("mp_post_send_on_stream failed: %s \n", strerror(ret));
+            // BUG: leaking req ??
+            goto cleanup;
+        }
+
+        ret = gds_prepare_wait_cq(client->send_cq, &req->gds_wait_info, 0);
+        if (ret) {
+            mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(ret));
+            // BUG: leaking req ??
+            goto cleanup;
+        }
+    }
+
+    *req_t = req;
+    goto out;
+
+cleanup:
+    if (tag_buf_reg)
+        mp_deregister(&tag_buf_reg);
+    if (tag_buf)
+        free(tag_buf);
+out:
+    return ret;
+}
+
 int mp_irecv_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t, 
                         mp_request_t *req_t, cudaStream_t stream)
 {

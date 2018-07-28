@@ -164,6 +164,9 @@ struct mp_request {
    int trigger;
    uint32_t id;
    int flags;
+   bool has_tag;
+   mp_reg_t tag_reg;
+   mp_reg_t recv_reg;
    struct CUstream_st *stream;
    union
    {
@@ -177,6 +180,7 @@ struct mp_request {
    } out;
    struct ibv_sge sg_entry;
    struct ibv_sge ud_sg_entry[2];
+   struct ibv_sge tag_sg_entry[2];
    struct ibv_sge *sgv;
    gds_send_request_t gds_send_info;
    gds_wait_request_t gds_wait_info;
@@ -197,6 +201,13 @@ typedef struct mem_region {
   void *region;
   struct mem_region *next;
 } mem_region_t;
+
+typedef struct tag_buf_entry {
+    int tag;
+    size_t size;
+    void *req_buf;
+    struct tag_buf_entry *next;
+} tag_buf_entry_t;
 
 extern client_t *clients;
 extern int *client_index;
@@ -248,6 +259,7 @@ int mp_warn_enabled();
 extern int use_event_sync;
 extern int mp_enable_ud;
 
+int process_tag_request(struct mp_request *req);
 int mp_progress_single_flow(mp_flow_t flow);
 void allocate_requests ();
 struct mp_request *new_stream_request(client_t *client, mp_req_type_t type, mp_state_t state, struct CUstream_st *stream);
