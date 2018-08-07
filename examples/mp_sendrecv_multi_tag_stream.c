@@ -38,26 +38,28 @@
 
 #define MIN_SIZE 1
 #define MAX_SIZE 64*1024
-#define ITER_COUNT_SMALL 20
-#define ITER_COUNT_LARGE 1
+#define ITER_COUNT 128
 #define WINDOW_SIZE 64 
 
 int comm_size, my_rank, peer;
 
-int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
+int sr_exchange (MPI_Comm comm, int iter_count, int validate)
 {
     int j;
-    size_t buf_size; 
+    const int size = sizeof(int);
+    const int times = 4;
+    size_t buf_size;
     cudaStream_t stream;
 
     /*application and pack buffers*/
-    void *buf = NULL, *sbuf_d = NULL, *rbuf_d = NULL;
+    int *buf = NULL, *sbuf_d = NULL, *rbuf_d = NULL;
 
     /*mp specific objects*/
     mp_request_t *sreq = NULL;
     mp_request_t *rreq = NULL;
     mp_reg_t sreg, rreg; 
 
+    iter_count *= times;
     buf_size = size*iter_count;
 
     /*allocating requests*/
@@ -79,22 +81,27 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
     MP_CHECK(mp_register(rbuf_d, buf_size, &rreg));
 
     if (validate) {
-        CUDA_CHECK(cudaMemset(sbuf_d, (my_rank + 1), buf_size));
+        for (j = 0; j < iter_count; j++) {
+            int tag = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+            buf[j] = tag;
+        }
+        CUDA_CHECK(cudaMemcpy(sbuf_d, buf, buf_size, cudaMemcpyDefault));
+        // CUDA_CHECK(cudaMemset(sbuf_d, (my_rank + 1), buf_size));
         CUDA_CHECK(cudaMemset(rbuf_d, 0, buf_size));
     }
 
     for (j = 0; j < iter_count; j++) {
         if (!my_rank) { 
-            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, j, &sreg, &sreq[j], stream));
+            MP_CHECK(mp_isend_tag_on_stream (&sbuf_d[j], size, peer, buf[j], &sreg, &sreq[j], stream));
             MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
 
-            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, j, &rreg, &rreq[j]));
+            MP_CHECK(mp_irecv_tag (&rbuf_d[j], size, peer, buf[j], &rreg, &rreq[j]));
             MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
         } else {
-            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, iter_count - 1 - j, &rreg, &rreq[j]));
+            MP_CHECK(mp_irecv_tag (&rbuf_d[j], size, peer, buf[j], &rreg, &rreq[j]));
             MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
 
-            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, iter_count - 1 - j, &sreg, &sreq[j], stream));
+            MP_CHECK(mp_isend_tag_on_stream (&sbuf_d[j], size, peer, buf[j], &sreg, &sreq[j], stream));
             MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
         }
     }
@@ -106,12 +113,12 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
     MPI_CHECK(MPI_Barrier(comm));
 
     if (validate && my_rank) {
+        memset(buf, 0, buf_size);
         CUDA_CHECK(cudaMemcpy(buf, rbuf_d, buf_size, cudaMemcpyDefault));
-        char *value = (char *) buf;
-        char expected = (char) (peer + 1);
-        for (j=0; j<(iter_count*size); j++) {
-             if (value[j] != (peer + 1)) {
-                fprintf(stderr, "validation check failed index: %d expected: %d actual: %d \n", j, expected, value[j]);
+        for (j=0; j < iter_count; j++) {
+            int expected = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+             if (buf[j] != expected) {
+                fprintf(stderr, "validation check failed index: %d expected: %d actual: %d \n", j, expected, buf[j]);
                  exit(-1);
              }
         }
@@ -132,7 +139,7 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
 
 int main (int c, char *v[])
 {
-    int iter_count, size;
+    int iter_count;
     int validate = 1;
 
     MPI_CHECK(MPI_Init(&c, &v));
@@ -153,18 +160,9 @@ int main (int c, char *v[])
     //Need to set CUDA_VISIBLE_DEVICES
     MP_CHECK(mp_init(MPI_COMM_WORLD, &peer, 1, MP_INIT_DEFAULT, 0));
 
-    iter_count = ITER_COUNT_SMALL;
-
-    for (size=MIN_SIZE; size<=MAX_SIZE; size*=2) 
-    {
-        if (size > 1024) {
-            iter_count = ITER_COUNT_LARGE;
-        }
-
-        sr_exchange(MPI_COMM_WORLD, size, iter_count, validate);
-
-        if (!my_rank) fprintf(stdout, "# SendRecv test passed validation with message size: %d \n", size);
-    }
+    iter_count = ITER_COUNT;
+    sr_exchange(MPI_COMM_WORLD, iter_count, validate);
+    if (!my_rank) fprintf(stdout, "# SendRecv test passed validation with %d iterations\n", iter_count);
 
     mp_finalize();
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
