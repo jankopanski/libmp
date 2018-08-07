@@ -112,7 +112,7 @@ int sr_exchange (MPI_Comm comm, int iter_count, int validate)
     CUDA_CHECK(cudaStreamQuery(stream));
     MPI_CHECK(MPI_Barrier(comm));
 
-    if (validate && my_rank) {
+    if (validate) {
         memset(buf, 0, buf_size);
         CUDA_CHECK(cudaMemcpy(buf, rbuf_d, buf_size, cudaMemcpyDefault));
         for (j=0; j < iter_count; j++) {
