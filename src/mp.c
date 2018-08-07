@@ -95,8 +95,14 @@ int ib_max_sge = 30;
 int ib_inline_size = 64;
 struct ibv_port_attr ib_port_attr;
 
+bool finalized = false; // Could mp_init be initialised more than once?
+pthread_t tag_matcher_thread;
+pthread_mutex_t tag_matcher_mutex = PTHREAD_MUTEX_INITIALIZER;
 tag_buf_entry_t *tag_buf_list_head = NULL;
 tag_buf_entry_t *tag_buf_list_tail = NULL;
+size_t tag_recv_request_list_length = 0;
+request_list_t tag_recv_request_list;
+// request_list_t matched_tag_recv_request_list;
 
 struct node_info { 
     char hname[20];
@@ -104,42 +110,6 @@ struct node_info {
 };
 
 struct node_info *node_info_all;
-
-#define MPI_CHECK(stmt)                                             \
-do {                                                                \
-    int result = (stmt);                                            \
-    if (MPI_SUCCESS != result) {                                    \
-        char string[MPI_MAX_ERROR_STRING];                          \
-        int resultlen = 0;                                          \
-        MPI_Error_string(result, string, &resultlen);               \
-        mp_err_msg(" (%s:%d) MPI check failed with %d (%*s)\n",     \
-                   __FILE__, __LINE__, result, resultlen, string);  \
-        exit(-1);                                                   \
-    }                                                               \
-} while(0)
-
-#define CU_CHECK(stmt)                                  \
-do {                                                    \
-    CUresult result = (stmt);                           \
-    if (CUDA_SUCCESS != result) {                       \
-        fprintf(stderr, "[%s:%d] [%d] cu failed with %d \n",    \
-         __FILE__, __LINE__, mpi_comm_rank, result);    \
-        exit(-1);                                       \
-    }                                                   \
-    assert(CUDA_SUCCESS == result);                     \
-} while (0)
-
-
-#define CUDA_CHECK(stmt)                                \
-do {                                                    \
-    cudaError_t result = (stmt);                        \
-    if (cudaSuccess != result) {                        \
-        fprintf(stderr, "[%s:%d] [%d] cuda failed with %s \n",   \
-         __FILE__, __LINE__, mpi_comm_rank, cudaGetErrorString(result)); \
-        exit(-1);                                       \
-    }                                                   \
-    assert(cudaSuccess == result);                      \
-} while (0)
 
 int mp_dbg_enabled()
 {
@@ -530,62 +500,40 @@ out:
     return ret;
 }
 
-int process_tag_request(struct mp_request *req) {
+int process_tag_recv_request(struct mp_request *req) 
+{
+    assert(req->type == MP_RECV);
+    assert(req->has_tag);
     int ret = MP_SUCCESS;
     int *tag_ptr = (int *) (req->tag_sg_entry[1].addr);
     void *recv_buf = (void *) req->tag_sg_entry[0].addr;
     size_t size = req->tag_sg_entry[0].length;
     tag_buf_entry_t *prev = NULL;
     tag_buf_entry_t *curr = tag_buf_list_head;
-    if (req->type == MP_SEND) {
-        ret = mp_deregister(&req->tag_reg);
-        if (ret) {
-            mp_err_msg("tag reg deregister failed\n");
-            return MP_FAILURE;
-        }
-        free(tag_ptr);
+    if (!curr) {
+        mp_err_msg("empty list\n");
+        return MP_FAILURE;
     }
-    else if (req->type == MP_RECV) {
-        if (!curr) {
-            mp_err_msg("empty list\n");
-            return MP_FAILURE;
-        }
-        do {
-            if (curr->tag == *tag_ptr && curr->size == size) {
-                CUDA_CHECK(cudaMemcpy(curr->req_buf, recv_buf, 
-                                    curr->size, cudaMemcpyDeviceToDevice));
-                ret = mp_deregister(&req->tag_reg);
-                if (ret) {
-                    mp_err_msg("tag reg deregister failed\n");
-                    return ret;
-                }
-                ret = mp_deregister(&req->recv_reg);
-                if (ret) {
-                    mp_err_msg("recv reg deregister failed\n");
-                    return ret;
-                }
-                CUDA_CHECK(cudaFree(recv_buf));
-                free(tag_ptr);
-                if (prev) {
-                    prev->next = curr->next;
-                }
-                else if (tag_buf_list_head == curr) {
-                    tag_buf_list_head = curr->next;
-                }
-                if (tag_buf_list_tail == curr) {
-                    tag_buf_list_tail = prev;
-                }
-                free(curr);
-                return ret;
+    do {
+        if (curr->tag == *tag_ptr && curr->size == size) {
+            CUDA_CHECK(cudaMemcpy(curr->req_buf, recv_buf, 
+                                curr->size, cudaMemcpyDeviceToDevice));
+            if (prev) {
+                prev->next = curr->next;
             }
-            prev = curr;
-            curr = curr->next;
-        } while (curr);
-        mp_err_msg("request not matching any tag\n");
-    }
-    else {
-        mp_err_msg("invalid request type\n");
-    }
+            else if (tag_buf_list_head == curr) {
+                tag_buf_list_head = curr->next;
+            }
+            if (tag_buf_list_tail == curr) {
+                tag_buf_list_tail = prev;
+            }
+            free(curr);
+            return ret;
+        }
+        prev = curr;
+        curr = curr->next;
+    } while (curr);
+    mp_err_msg("request not matching any tag\n");
     return MP_FAILURE;
 }
 
@@ -608,6 +556,11 @@ int mp_wait_all (uint32_t count, mp_request_t *req_)
     /*poll until completion*/
     while (complete < count) {
         struct mp_request *req = req_[complete];
+
+        if (req->has_tag && req->type == MP_RECV) {
+            complete++;
+            continue;
+        }
     	
         // user did not call post_wait_cq()
         // if req->status == WAIT_PENDING && it is a stream request
@@ -649,6 +602,16 @@ int mp_wait_all (uint32_t count, mp_request_t *req_)
 
     while (complete < count) {
         struct mp_request *req = req_[complete];
+
+        if (req->has_tag && req->type == MP_RECV) {
+            pthread_mutex_lock(&req->mutex);
+            while (req->tag_state_host != MP_TAG_MATCHED) {
+                pthread_cond_wait(&req->cond, &req->mutex);
+            }
+            pthread_mutex_unlock(&req->mutex);
+            complete++;
+            continue;
+        }
         
         while (req->status != MP_COMPLETE) {
             ret = mp_progress_single_flow (TX_FLOW);
@@ -691,7 +654,7 @@ int mp_wait_all (uint32_t count, mp_request_t *req_)
             struct mp_request *req = req_[complete];
             if (req->status == MP_COMPLETE) {
                 if (req->has_tag) {
-                    process_tag_request(req);
+                    release_mp_request_tag_resources(req);
                 }
                 release_mp_request((struct mp_request *) req);
             }
@@ -1409,6 +1372,15 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
       }
   }
 
+  TAILQ_INIT(&tag_recv_request_list);
+//   TAILQ_INIT(&matched_tag_recv_request_list);
+//   place to initialize mutex
+  ret = pthread_create(&tag_matcher_thread, NULL, tag_matcher_function, NULL);
+  if (ret) {
+      mp_err_msg("pthread_create returned error %d\n", ret);
+      return MP_FAILURE;
+  }
+
   free(qpinfo_all);
 
   return MP_SUCCESS;
@@ -1416,10 +1388,24 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
 
 void mp_finalize ()
 {
-  int i;
+  int i, ret;
   mem_region_t *mem_region = NULL;
 
   MPI_Barrier(mpi_comm);
+
+  ret = pthread_mutex_lock(&tag_matcher_mutex);
+  if (ret) {
+      mp_warn_msg("pthread_mutex_lock return error %d\n", ret);
+  }
+  finalized = true;
+  ret = pthread_mutex_unlock(&tag_matcher_mutex);
+  if (ret) {
+      mp_warn_msg("pthread_mutex_unlock return error %d\n", ret);
+  }
+  ret = pthread_join(tag_matcher_thread, NULL);
+  if (ret) {
+      mp_warn_msg("pthread_join return error %d\n", ret);
+  }
 
   /*destroy IB resources*/
   for (i=0; i<client_count; i++) {
@@ -1534,12 +1520,13 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
     //int ret_progress = 0;
     int *tag_buf = NULL;
     void *recv_buf = NULL;
+    request_entry_t *new_request_entry = NULL;
     size_t tag_buf_size = sizeof(int);
     struct mp_request *req = NULL;
     struct mp_reg *reg = (struct mp_reg *) *reg_t;
     struct mp_reg *tag_buf_reg = NULL;
     struct mp_reg *recv_buf_reg = NULL;
-    tag_buf_entry_t *new_entry = NULL;
+    tag_buf_entry_t *new_buf_entry = NULL;
     client_t *client = &clients[client_index[peer]];
 
     req = new_request(client, MP_RECV, MP_PENDING_NOWAIT);
@@ -1548,19 +1535,16 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
     mp_dbg_msg("peer=%d req=%p buf=%p size=%d id=%d reg=%p key=%x\n", peer, req, buf, size, req->id, reg, reg->key);
 
     CUDA_CHECK(cudaMalloc(&recv_buf, size));
+    CUDA_CHECK(cudaMalloc((void **) &req->tag_state_device, sizeof(mp_tag_state_t)));
     tag_buf = (int *) malloc(tag_buf_size);
-    // recv_buf = malloc(size);
-    new_entry = (tag_buf_entry_t *) malloc(sizeof(tag_buf_entry_t));
-    if (!tag_buf || !recv_buf || !new_entry) {
+    new_buf_entry = (tag_buf_entry_t *) malloc(sizeof(tag_buf_entry_t));
+    new_request_entry = (request_entry_t *) malloc(sizeof(request_entry_t));
+    if (!tag_buf || !new_buf_entry || !new_request_entry) {
         mp_err_msg("cannot allocate memory\n");
         ret = ENOMEM;
         goto cleanup;
     }
-    *tag_buf = tag;
-    new_entry->tag = tag;
-    new_entry->size = size;
-    new_entry->req_buf = buf;
-    new_entry->next = NULL;
+
     ret = mp_register(tag_buf, tag_buf_size, &tag_buf_reg);
     if (ret) {
         mp_err_msg("mp_register failed\n");
@@ -1571,18 +1555,50 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
         mp_err_msg("mp_register failed\n");
         goto cleanup;
     }
+
+    *tag_buf = tag;
+    new_buf_entry->tag = tag;
+    new_buf_entry->size = size;
+    new_buf_entry->req_buf = buf;
+    new_buf_entry->next = NULL;
+    new_request_entry->req = req;
+
+    req->has_tag = true;
     req->tag_reg = tag_buf_reg;
     req->recv_reg = recv_buf_reg;
-    req->has_tag = true;
+    req->tag_state_host = MP_TAG_ISSUED;
+    CUDA_CHECK(cudaMemset((void *) req->tag_state_device, MP_TAG_ISSUED, sizeof(mp_tag_state_t)));
+    ret = pthread_mutex_init(&req->mutex, NULL);
+    if (ret) {
+        mp_err_msg("pthread_mutex_init returned error %d\n", ret);
+        goto cleanup;
+    }
+    ret = pthread_cond_init(&req->cond, NULL);
+    if (ret) {
+        mp_err_msg("pthread_cond_init returned error %d\n", ret);
+        goto cleanup;
+    }
     
+    ret = pthread_mutex_lock(&tag_matcher_mutex);
+    if (ret) {
+        mp_err_msg("pthread_mutex_lock return error %d\n", ret);
+        goto cleanup;
+    }
     if (tag_buf_list_tail) {
         assert(tag_buf_list_head);
-        tag_buf_list_tail->next = new_entry;
-        tag_buf_list_tail = new_entry;
+        tag_buf_list_tail->next = new_buf_entry;
+        tag_buf_list_tail = new_buf_entry;
     }
     else {
         assert(!tag_buf_list_head);
-        tag_buf_list_head = tag_buf_list_tail = new_entry;
+        tag_buf_list_head = tag_buf_list_tail = new_buf_entry;
+    }
+    TAILQ_INSERT_TAIL(&tag_recv_request_list, new_request_entry, ptrs);
+    tag_recv_request_list_length++;
+    ret = pthread_mutex_unlock(&tag_matcher_mutex);
+    if (ret) {
+        mp_err_msg("pthread_mutex_unlock return error %d\n", ret);
+        goto cleanup;
     }
 
     req->in.rr.next = NULL;
@@ -1632,16 +1648,19 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
     goto out;
 
 cleanup:
-    if (tag_buf_reg)
-        mp_deregister(&tag_buf_reg);
-    if (recv_buf_reg)
-        mp_deregister(&recv_buf_reg);
-    if (tag_buf)
-        free(tag_buf);
-    if (recv_buf)
-        free(recv_buf);
-    if (new_entry)
-        free(new_entry);
+    // if (tag_buf_reg)
+    //     mp_deregister(&tag_buf_reg);
+    // if (recv_buf_reg)
+    //     mp_deregister(&recv_buf_reg);
+    // if (tag_buf)
+    //     free(tag_buf);
+    // if (recv_buf)
+    //     free(recv_buf);
+    release_mp_request_tag_resources(req);
+    if (new_buf_entry)
+        free(new_buf_entry);
+    if (new_request_entry)
+        free(new_request_entry);
 out:
     return ret;
 }
@@ -1977,6 +1996,34 @@ void release_mp_request(struct mp_request *req)
   mp_request_free_list = req;
 }
 
+void release_mp_request_tag_resources(struct mp_request *req)
+{
+    int ret;
+    void *recv_buf = (void *) req->tag_sg_entry[0].addr;
+    int *tag_buf = (int *) req->tag_sg_entry[1].addr;
+    assert(req->has_tag);
+    if (req->tag_reg)
+        mp_deregister(&req->tag_reg);
+    if (tag_buf)
+        free(tag_buf);
+    if (req->type == MP_RECV) {
+        if (req->recv_reg)
+            mp_deregister(&req->recv_reg);
+        if (recv_buf)
+            CUDA_CHECK(cudaFree(recv_buf));
+        if (req->tag_state_device)
+            CUDA_CHECK(cudaFree((void *) req->tag_state_device));
+        ret = pthread_mutex_destroy(&req->mutex);
+        if (ret) {
+            mp_warn_msg("pthread_mutex_destroy retruned error %d\n", ret);
+        }
+        ret = pthread_cond_destroy(&req->cond);
+        if (ret) {
+            mp_warn_msg("pthread_cond_destroy retruned error %d\n", ret);
+        }
+    }
+}
+
 /*one-sided operations: window creation, put and get*/
 int mp_window_create(void *addr, size_t size, mp_window_t *window_t) 
 {
@@ -2204,3 +2251,75 @@ int mp_query_param(mp_param_t param, int *value)
         return ret;
 }
 
+void *tag_matcher_function(void *arg) {
+    int ret = MP_SUCCESS;
+    bool exit_thread = false;
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    // mp_info_msg("info thread enter\n");
+    for (;;) {
+        ret = pthread_mutex_lock(&tag_matcher_mutex);
+        if (ret) {
+            mp_warn_msg("pthread_mutex_lock return error %d\n", ret);
+        }
+        exit_thread = finalized;
+
+        if (!TAILQ_EMPTY(&tag_recv_request_list)) {
+            for (int i = 0; i < tag_recv_request_list_length; i++) {
+                // TODO need a mutex for request inside mp_progress_single_flow
+                ret = mp_progress_single_flow(RX_FLOW);
+                if (ret) {
+                    mp_warn_msg("mp_progress_single_flow failed\n");
+                }
+            }
+            request_entry_t *curr = TAILQ_FIRST(&tag_recv_request_list);
+            while (curr) {
+                mp_request_t req = curr->req;
+                ret = pthread_mutex_lock(&req->mutex);
+                if (ret) {
+                    mp_warn_msg("pthread_mutex_lock return error %d\n", ret);
+                }
+                if (req->status == MP_COMPLETE) {
+                    ret = process_tag_recv_request(req);
+                    if (ret) {
+                        mp_warn_msg("process_tag_recv_request failed\n");
+                    }
+                    CU_CHECK(cuStreamWriteValue32(
+                        stream, 
+                        req->tag_state_device, 
+                        (cuuint32_t) MP_TAG_MATCHED, 
+                        0
+                    ));
+                    req->tag_state_host = MP_TAG_MATCHED;
+                    ret = pthread_cond_signal(&req->cond);
+                    if (ret) {
+                        mp_warn_msg("pthread_cond_signal return error %d\n", ret);
+                    }
+                    request_entry_t *next = TAILQ_NEXT(curr, ptrs);
+                    TAILQ_REMOVE(&tag_recv_request_list, curr, ptrs);
+                    tag_recv_request_list_length--;
+                    free(curr);
+                    curr = next;
+                }
+                else {
+                    curr = TAILQ_NEXT(curr, ptrs);
+                }
+                ret = pthread_mutex_unlock(&req->mutex);
+                if (ret) {
+                    mp_warn_msg("pthread_mutex_unlock return error %d\n", ret);
+                }
+            }
+        }
+
+        ret = pthread_mutex_unlock(&tag_matcher_mutex);
+        if (ret) {
+            mp_warn_msg("pthread_mutex_unlock return error %d\n", ret);
+        }
+        if (exit_thread) {
+            break;
+        }
+        sleep(1);
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return 0;
+}

@@ -2,10 +2,11 @@
 #include <mp.h>
 #include "test_utils.h"
 
-const int sleep_time = 0;
+const int sleep_time = 20;
 
 int main(int argc, char const *argv[])
 {
+    // sleep(sleep_time);
     int comm_size, my_rank, peer;
     int tag = 42;
     MPI_Init(&argc, (char ***) &argv);
@@ -30,18 +31,20 @@ int main(int argc, char const *argv[])
     if (!my_rank) {
         buf = (char *) "SEND_TEST";
         CUDA_CHECK(cudaMemcpy(buf_d, buf, buf_size, cudaMemcpyHostToDevice));
-        sleep(sleep_time);
+        // MPI_Barrier(MPI_COMM_WORLD);
         MP_CHECK(mp_isend_tag_on_stream(buf_d, buf_size, peer, tag, 
                                         &reg, &req, stream));
         fprintf(stderr, "send %d\n", my_rank);
     }
     else {
         CUDA_CHECK(cudaMemset(buf_d, 0, buf_size));
-        sleep(sleep_time);
         MP_CHECK(mp_irecv_tag(buf_d, buf_size, peer, tag, &reg, &req));
+        // MPI_Barrier(MPI_COMM_WORLD);
         fprintf(stderr, "recv %d\n", my_rank);
     }
-    MP_CHECK(mp_wait_on_stream(&req, stream));
+    // sleep(sleep_time);
+    // MP_CHECK(mp_wait_on_stream(&req, stream));
+    MP_CHECK(mp_wait_tag_on_stream(&req, stream));
     fprintf(stderr, "wait on stream %d\n", my_rank);
     MP_CHECK(mp_wait(&req));
     fprintf(stderr, "wait %d\n", my_rank);

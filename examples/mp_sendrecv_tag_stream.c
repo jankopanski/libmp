@@ -47,6 +47,8 @@ int comm_size, my_rank, peer;
 int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
 {
     int j;
+    int tag;
+    const int mul = 3;
     size_t buf_size; 
     cudaStream_t stream;
 
@@ -58,6 +60,7 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
     mp_request_t *rreq = NULL;
     mp_reg_t sreg, rreg; 
 
+    iter_count *= mul;
     buf_size = size*iter_count;
 
     /*allocating requests*/
@@ -84,18 +87,22 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
     }
 
     for (j = 0; j < iter_count; j++) {
-        if (!my_rank) { 
-            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, j, &sreg, &sreq[j], stream));
-            MP_CHECK(mp_wait_on_stream(&sreq[j], stream));
+        if (!my_rank) {
+            tag = j % mul;
 
-            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, j, &rreg, &rreq[j]));
-            MP_CHECK(mp_wait_on_stream(&rreq[j], stream));
+            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, tag, &sreg, &sreq[j], stream));
+            MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
+
+            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, tag, &rreg, &rreq[j]));
+            MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
         } else {
-            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, iter_count - 1 - j, &rreg, &rreq[j]));
-            MP_CHECK(mp_wait_on_stream(&rreq[j], stream));
+            tag = (iter_count - 1 - j) % mul;
 
-            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, iter_count - 1 - j, &sreg, &sreq[j], stream));
-            MP_CHECK(mp_wait_on_stream(&sreq[j], stream));
+            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, tag, &rreg, &rreq[j]));
+            MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
+
+            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, tag, &sreg, &sreq[j], stream));
+            MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
         }
     }
     MP_CHECK(mp_wait_all(iter_count, rreq));

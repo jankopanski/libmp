@@ -568,10 +568,11 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     goto out;
 
 cleanup:
-    if (tag_buf_reg)
-        mp_deregister(&tag_buf_reg);
-    if (tag_buf)
-        free(tag_buf);
+    release_mp_request_tag_resources(req);
+    // if (tag_buf_reg)
+    //     mp_deregister(&tag_buf_reg);
+    // if (tag_buf)
+    //     free(tag_buf);
 out:
     return ret;
 }
@@ -1282,6 +1283,20 @@ int mp_wait_on_stream (mp_request_t *req_t, cudaStream_t stream)
 
 out:
     return ret;
+}
+
+int mp_wait_tag_on_stream (mp_request_t *req_t, cudaStream_t stream) {
+    assert(req_t);
+    int ret;
+    struct mp_request *req = *req_t;
+    assert(req->type == MP_SEND || req->type == MP_RECV);
+    ret = mp_wait_on_stream(req_t, stream);
+    if (!ret || req->type == MP_SEND) {
+        return ret;
+    }
+    CU_CHECK(cuStreamWaitValue32(stream, (CUdeviceptr) req->tag_state_device, 
+            (cuuint32_t) MP_TAG_MATCHED, CU_STREAM_WAIT_VALUE_EQ));
+    return MP_SUCCESS;
 }
 
 /*----------------------------------------------------------------------------*/

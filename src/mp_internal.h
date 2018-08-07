@@ -31,6 +31,7 @@
 #include <assert.h>
 #include <infiniband/verbs.h>
 #include <gdsync.h>
+#include <sys/queue.h>
 
 #ifdef __cplusplus
 extern "C" 
@@ -52,6 +53,11 @@ typedef enum mp_state {
     MP_COMPLETE,
     MP_N_STATES
 } mp_state_t ;
+
+typedef enum mp_tag_state {
+    MP_TAG_ISSUED,
+    MP_TAG_MATCHED
+} mp_tag_state_t;
 
 typedef enum mp_req_type {
     MP_NULL = 0,
@@ -167,6 +173,10 @@ struct mp_request {
    bool has_tag;
    mp_reg_t tag_reg;
    mp_reg_t recv_reg;
+   mp_tag_state_t tag_state_host;
+   CUdeviceptr tag_state_device;
+   pthread_mutex_t mutex;
+   pthread_cond_t cond;
    struct CUstream_st *stream;
    union
    {
@@ -208,6 +218,49 @@ typedef struct tag_buf_entry {
     void *req_buf;
     struct tag_buf_entry *next;
 } tag_buf_entry_t;
+
+typedef struct request_entry {
+    mp_request_t req;
+    TAILQ_ENTRY(request_entry) ptrs;
+} request_entry_t;
+
+typedef TAILQ_HEAD(request_list_head_s, request_entry) request_list_t;
+
+#define MPI_CHECK(stmt)                                             \
+do {                                                                \
+    int result = (stmt);                                            \
+    if (MPI_SUCCESS != result) {                                    \
+        char string[MPI_MAX_ERROR_STRING];                          \
+        int resultlen = 0;                                          \
+        MPI_Error_string(result, string, &resultlen);               \
+        mp_err_msg(" (%s:%d) MPI check failed with %d (%*s)\n",     \
+                   __FILE__, __LINE__, result, resultlen, string);  \
+        exit(-1);                                                   \
+    }                                                               \
+} while(0)
+
+#define CU_CHECK(stmt)                                  \
+do {                                                    \
+    CUresult result = (stmt);                           \
+    if (CUDA_SUCCESS != result) {                       \
+        fprintf(stderr, "[%s:%d] [%d] cu failed with %d \n",    \
+         __FILE__, __LINE__, mpi_comm_rank, result);    \
+        exit(-1);                                       \
+    }                                                   \
+    assert(CUDA_SUCCESS == result);                     \
+} while (0)
+
+
+#define CUDA_CHECK(stmt)                                \
+do {                                                    \
+    cudaError_t result = (stmt);                        \
+    if (cudaSuccess != result) {                        \
+        fprintf(stderr, "[%s:%d] [%d] cuda failed with %s \n",   \
+         __FILE__, __LINE__, mpi_comm_rank, cudaGetErrorString(result)); \
+        exit(-1);                                       \
+    }                                                   \
+    assert(cudaSuccess == result);                      \
+} while (0)
 
 extern client_t *clients;
 extern int *client_index;
@@ -259,7 +312,9 @@ int mp_warn_enabled();
 extern int use_event_sync;
 extern int mp_enable_ud;
 
-int process_tag_request(struct mp_request *req);
+int process_tag_recv_request(struct mp_request *req);
+void *tag_matcher_function(void *arg);
+
 int mp_progress_single_flow(mp_flow_t flow);
 void allocate_requests ();
 struct mp_request *new_stream_request(client_t *client, mp_req_type_t type, mp_state_t state, struct CUstream_st *stream);
@@ -268,6 +323,7 @@ static inline struct mp_request *new_request(client_t *client, mp_req_type_t typ
     return new_stream_request(client, type, state, 0);
 }
 void release_mp_request(struct mp_request *req);
+void release_mp_request_tag_resources(struct mp_request *req);
 
 //void init_req (struct mp_request *req);
 

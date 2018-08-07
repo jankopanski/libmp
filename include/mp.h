@@ -131,6 +131,7 @@ int mp_isendv_on_stream (struct iovec *v, int nblocks, int peer, mp_reg_t *mp_re
  * GPU synchronous functions
  */
 int mp_wait_on_stream (mp_request_t *req, cudaStream_t stream);
+int mp_wait_tag_on_stream (mp_request_t *req, cudaStream_t stream);
 int mp_wait_all_on_stream (uint32_t count, mp_request_t *req, cudaStream_t stream);
 
 
