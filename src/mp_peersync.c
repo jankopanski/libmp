@@ -509,13 +509,12 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         // req->in.sr.wr.ud.remote_qkey = 0;
     }
 
-    req->tag_sg_entry[0].length = size;
-    req->tag_sg_entry[0].lkey = reg->key;
-    req->tag_sg_entry[0].addr = (uintptr_t)(buf);
-    req->tag_sg_entry[1].length = tag_buf_size;
-    req->tag_sg_entry[1].lkey = tag_buf_reg->key;
-    req->tag_sg_entry[1].addr = (uintptr_t) tag_buf;
-
+    req->tag_sg_entry[0].length = tag_buf_size;
+    req->tag_sg_entry[0].lkey = tag_buf_reg->key;
+    req->tag_sg_entry[0].addr = (uintptr_t) tag_buf;
+    req->tag_sg_entry[1].length = size;
+    req->tag_sg_entry[1].lkey = reg->key;
+    req->tag_sg_entry[1].addr = (uintptr_t)(buf);
 
     if (use_event_sync) {
         client->last_posted_trigger_id[mp_type_to_flow(req->type)] = req->id;

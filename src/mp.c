@@ -505,9 +505,9 @@ int process_tag_recv_request(struct mp_request *req)
     assert(req->type == MP_RECV);
     assert(req->has_tag);
     int ret = MP_SUCCESS;
-    int *tag_ptr = (int *) (req->tag_sg_entry[1].addr);
-    void *recv_buf = (void *) req->tag_sg_entry[0].addr;
-    size_t size = req->tag_sg_entry[0].length;
+    int *tag_ptr = (int *) (req->tag_sg_entry[0].addr);
+    void *recv_buf = (void *) req->tag_sg_entry[1].addr;
+    size_t size = req->tag_sg_entry[1].length;
     tag_buf_entry_t *prev = NULL;
     tag_buf_entry_t *curr = tag_buf_list_head;
     if (!curr) {
@@ -1619,15 +1619,12 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
     } else { 
         req->in.rr.num_sge = 2;
         req->in.rr.sg_list = req->tag_sg_entry;
-        // req->sg_entry[0].length = size;
-        // req->sg_entry[0].lkey = reg->key;
-        // req->sg_entry[0].addr = (uintptr_t)(buf);
-        req->tag_sg_entry[0].length = size;
-        req->tag_sg_entry[0].lkey = recv_buf_reg->key;
-        req->tag_sg_entry[0].addr = (uintptr_t)(recv_buf);
-        req->tag_sg_entry[1].length = tag_buf_size;
-        req->tag_sg_entry[1].lkey = tag_buf_reg->key;
-        req->tag_sg_entry[1].addr = (uintptr_t)(tag_buf);
+        req->tag_sg_entry[0].length = tag_buf_size;
+        req->tag_sg_entry[0].lkey = tag_buf_reg->key;
+        req->tag_sg_entry[0].addr = (uintptr_t)(tag_buf);
+        req->tag_sg_entry[1].length = size;
+        req->tag_sg_entry[1].lkey = recv_buf_reg->key;
+        req->tag_sg_entry[1].addr = (uintptr_t)(recv_buf);
     }
     //progress (remove) some request on the RX flow if is not possible to queue a recv request
     ret = mp_post_recv(client, req);
@@ -1999,8 +1996,8 @@ void release_mp_request(struct mp_request *req)
 void release_mp_request_tag_resources(struct mp_request *req)
 {
     int ret;
-    void *recv_buf = (void *) req->tag_sg_entry[0].addr;
-    int *tag_buf = (int *) req->tag_sg_entry[1].addr;
+    int *tag_buf = (int *) req->tag_sg_entry[0].addr;
+    void *recv_buf = (void *) req->tag_sg_entry[1].addr;
     assert(req->has_tag);
     if (req->tag_reg)
         mp_deregister(&req->tag_reg);
