@@ -36,10 +36,13 @@
 #include <mp.h>
 #include "test_utils.h"
 
+// #define MIN_SIZE 1
 #define MIN_SIZE 1
 #define MAX_SIZE 64*1024
-#define ITER_COUNT_SMALL 20
-#define ITER_COUNT_LARGE 1
+// #define ITER_COUNT_SMALL 20
+#define ITER_COUNT_SMALL 100
+// #define ITER_COUNT_LARGE 1
+#define ITER_COUNT_LARGE 10
 #define WINDOW_SIZE 64 
 
 int comm_size, my_rank, peer;
@@ -91,15 +94,17 @@ int sr_exchange (MPI_Comm comm, int size, int iter_count, int validate)
             MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, j, &rreg, &rreq[j]));
             MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
         } else {
-            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, iter_count - 1 - j, &rreg, &rreq[j]));
+            // MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, iter_count - 1 - j, &rreg, &rreq[j]));
+            MP_CHECK(mp_irecv_tag ((void *)((uintptr_t)rbuf_d + size*j), size, peer, j, &rreg, &rreq[j]));
             MP_CHECK(mp_wait_tag_on_stream(&rreq[j], stream));
 
-            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, iter_count - 1 - j, &sreg, &sreq[j], stream));
+            // MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, iter_count - 1 - j, &sreg, &sreq[j], stream));
+            MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)sbuf_d + size*j), size, peer, j, &sreg, &sreq[j], stream));
             MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
         }
     }
-    MP_CHECK(mp_wait_all(iter_count, rreq));
-    MP_CHECK(mp_wait_all(iter_count, sreq));
+    MP_CHECK(mp_wait_all_tag(iter_count, rreq));
+    MP_CHECK(mp_wait_all_tag(iter_count, sreq));
     // all ops in the stream should have been completed 
     usleep(1000);
     CUDA_CHECK(cudaStreamQuery(stream));

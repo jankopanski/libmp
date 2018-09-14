@@ -82,7 +82,8 @@ int sr_exchange (MPI_Comm comm, int iter_count, int validate)
 
     if (validate) {
         for (j = 0; j < iter_count; j++) {
-            int tag = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+            // int tag = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+            int tag = j % iter_count;
             buf[j] = tag;
         }
         CUDA_CHECK(cudaMemcpy(sbuf_d, buf, buf_size, cudaMemcpyDefault));
@@ -105,8 +106,8 @@ int sr_exchange (MPI_Comm comm, int iter_count, int validate)
             MP_CHECK(mp_wait_tag_on_stream(&sreq[j], stream));
         }
     }
-    MP_CHECK(mp_wait_all(iter_count, rreq));
-    MP_CHECK(mp_wait_all(iter_count, sreq));
+    MP_CHECK(mp_wait_all_tag(iter_count, rreq));
+    MP_CHECK(mp_wait_all_tag(iter_count, sreq));
     // all ops in the stream should have been completed 
     usleep(1000);
     CUDA_CHECK(cudaStreamQuery(stream));
@@ -115,8 +116,9 @@ int sr_exchange (MPI_Comm comm, int iter_count, int validate)
     if (validate) {
         memset(buf, 0, buf_size);
         CUDA_CHECK(cudaMemcpy(buf, rbuf_d, buf_size, cudaMemcpyDefault));
-        for (j=0; j < iter_count; j++) {
-            int expected = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+        for (j = 0; j < iter_count; j++) {
+            // int expected = (!my_rank ? j : iter_count - 1 - j) % iter_count;
+            int expected = j % iter_count;
              if (buf[j] != expected) {
                 fprintf(stderr, "validation check failed index: %d expected: %d actual: %d \n", j, expected, buf[j]);
                  exit(-1);

@@ -107,7 +107,7 @@ int sr_exchange (MPI_Comm comm, int index, int size, int iter_count)
             for (int i = 0; i < peer_num; i++) {
                 times[index][0] -= MPI_Wtime();
                 MP_CHECK(mp_isend_tag_on_stream ((void *)((uintptr_t)buf_d + (j * peer_num + i) * size), 
-                                                size, i - 1, j, &reg, &req[j * peer_num + i], stream));
+                                                size, i + 1, j, &reg, &req[j * peer_num + i], stream));
                 times[index][0] += MPI_Wtime();
                 CUDA_CHECK(cudaEventRecord(start[j * peer_num + i]));
                 times[index][1] -= MPI_Wtime();
@@ -163,6 +163,9 @@ int sr_exchange (MPI_Comm comm, int index, int size, int iter_count)
 
 int main (int c, char *v[])
 {
+    // if (!my_rank) sleep(20);
+    // else sleep(1200);
+
     int iter_count;
     int *peers;
     int validate = 1;
@@ -218,8 +221,8 @@ int main (int c, char *v[])
     print(MPI_COMM_WORLD);
 
     mp_finalize();
+    free(peers);
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
     MPI_CHECK(MPI_Finalize());
-    free(peers);
     return 0;
 }

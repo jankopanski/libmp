@@ -39,8 +39,8 @@
 
 #define MIN_SIZE 1
 #define MAX_SIZE 64*1024
-#define ITER_COUNT_SMALL 20
-#define ITER_COUNT_LARGE 5
+#define ITER_COUNT_SMALL 40
+#define ITER_COUNT_LARGE 20
 
 constexpr int intlog2(int x) {
     int y = 0;
@@ -64,6 +64,7 @@ void print(MPI_Comm comm) {
                     times[i][0], times[i][1], times[i][2], times[i][3]);
         }
     }
+    fflush(stdout);
     MPI_CHECK(MPI_Barrier(comm));
     if (my_rank) {
         printf("\nReceiver\n");
@@ -129,7 +130,7 @@ int sr_exchange (MPI_Comm comm, int index, int size, int iter_count)
         }
     }
     times[index][2] -= MPI_Wtime();
-    MP_CHECK(mp_wait_all(iter_count, req));
+    MP_CHECK(mp_wait_all_tag(iter_count, req));
     times[index][2] += MPI_Wtime();
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -183,7 +184,7 @@ int main (int c, char *v[])
     iter_count = ITER_COUNT_SMALL;
 
     if (!my_rank) {
-        printf("Number of messages for messages of size\n <= 1024 B: %d\n  > 1024 B: %d\n\n", 
+        printf("Number of messages of size\n <= 1024 B: %d\n  > 1024 B: %d\n\n", 
                 ITER_COUNT_SMALL, ITER_COUNT_LARGE);
         printf("Average time per single call\n\n");
     }
@@ -195,7 +196,7 @@ int main (int c, char *v[])
         }
 
         sr_exchange(MPI_COMM_WORLD, i, size, iter_count);
-
+        fprintf(stderr, "Iteration: %d, size: %d\n", i, size);
     }
 
     print(MPI_COMM_WORLD);
