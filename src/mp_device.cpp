@@ -70,8 +70,9 @@ namespace mp {
         int get_descriptors(send_desc_t *sinfo, mp_request_t *req_t)
         {
             int retcode;
-            int ret = 0; 
-            struct mp_request *req = *req_t;
+            int ret = 0;
+            struct mp_user_request *user_req = *req_t;
+            struct mp_request *req = user_req->internal_req;
 
             mp_dbg_msg("req=%p status=%d id=%d\n", req, req->status, req->id);
 
@@ -106,7 +107,8 @@ namespace mp {
         {
             int retcode;
             int ret = 0;
-            struct mp_request *req = *req_t;
+            struct mp_user_request *user_req = *req_t;
+            struct mp_request *req = user_req->internal_req;
             client_t *client = &clients[client_index[req->peer]];
 
             mp_dbg_msg("req=%p status=%d id=%d\n", req, req->status, req->id);

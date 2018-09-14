@@ -59,9 +59,9 @@ typedef enum mp_param {
 int mp_query_param(mp_param_t param, int *value);
 
 struct mp_reg; 
-struct mp_request; 
+struct mp_user_request; 
 typedef struct mp_reg* mp_reg_t;
-typedef struct mp_request* mp_request_t; 
+typedef struct mp_user_request* mp_request_t; 
 typedef struct mp_window* mp_window_t;
 
 enum mp_init_flags {
@@ -103,6 +103,7 @@ int mp_isend (void *buf, int size, int peer, mp_reg_t *mp_reg, mp_request_t *req
 
 int mp_wait (mp_request_t *req);
 int mp_wait_all (uint32_t count, mp_request_t *req);
+int mp_wait_all_tag (uint32_t count, mp_request_t *req);
 int mp_progress_all (uint32_t count, mp_request_t *req);
 
 

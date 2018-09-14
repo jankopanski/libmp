@@ -142,7 +142,8 @@ int mp_desc_queue_add_send(mp_desc_queue_t *pdq, mp_request_t *req_t)
     assert(dq);
 
     assert(req_t);
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
     assert(req);
     assert(req_type_tx(req->type));
     assert(req->status == MP_PREPARED);
@@ -164,7 +165,8 @@ int mp_desc_queue_add_wait_send(mp_desc_queue_t *pdq, mp_request_t *req_t)
     assert(dq);
 
     assert(req_t);
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
     assert(req);
     assert(req_type_tx(req->type));
     assert(req_can_be_waited(req));
@@ -190,7 +192,8 @@ int mp_desc_queue_add_wait_recv(mp_desc_queue_t *pdq, mp_request_t *req_t)
     assert(dq);
 
     assert(req_t);
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
     assert(req);
     assert(req_type_rx(req->type));
     assert(req->status == MP_PENDING_NOWAIT || req->status == MP_COMPLETE);

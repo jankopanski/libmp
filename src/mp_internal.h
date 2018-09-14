@@ -54,11 +54,6 @@ typedef enum mp_state {
     MP_N_STATES
 } mp_state_t ;
 
-typedef enum mp_tag_state {
-    MP_TAG_ISSUED,
-    MP_TAG_MATCHED
-} mp_tag_state_t;
-
 typedef enum mp_req_type {
     MP_NULL = 0,
     MP_SEND,
@@ -80,10 +75,10 @@ typedef enum mp_flow {
     N_FLOWS
 } mp_flow_t;
 
-typedef enum mp_req_list {
-    PREPARED_LIST,
-    PENDING_LIST,
-} mp_req_list_t;
+// typedef enum mp_req_list {
+//     PREPARED_LIST,
+//     PENDING_LIST,
+// } mp_req_list_t;
 
 typedef struct {
    uint32_t busy;
@@ -114,6 +109,55 @@ typedef struct ipc_handle_cache_entry {
     struct ipc_handle_cache_entry *next;
     struct ipc_handle_cache_entry *prev;
 } ipc_handle_cache_entry_t;
+
+struct mp_request {
+   mp_req_type_t type;
+   int peer;
+   volatile int status;
+   int trigger;
+   uint32_t id;
+   int flags;
+   struct CUstream_st *stream;
+   union
+   {
+       struct ibv_recv_wr rr;
+       gds_send_wr sr;
+   } in;
+   union
+   {
+       gds_send_wr* bad_sr;
+       struct ibv_recv_wr* bad_rr;
+   } out;
+   struct ibv_sge sg_entry;
+   struct ibv_sge ud_sg_entry[2];
+   struct ibv_sge *sgv;
+   gds_send_request_t gds_send_info;
+   gds_wait_request_t gds_wait_info;
+   struct mp_request *next;
+   struct mp_request *prev;
+   /* tag related */
+   mp_reg_t tag_reg;
+   mp_reg_t tmp_reg;
+   struct ibv_sge tag_sg_entry[2];
+   struct mp_user_request *user_req;
+   TAILQ_ENTRY(mp_request) entries;
+};
+
+struct mp_user_request {
+    mp_req_type_t type;
+    volatile bool completed_host;
+    cuuint32_t *completed_device; // 32-bit device pointer
+    int tag;
+    size_t size;
+    void *user_buf;
+    struct mp_request *internal_req;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    TAILQ_ENTRY(mp_user_request) entries;
+};
+
+typedef TAILQ_HEAD(mp_internal_request_list_head_s, mp_request) mp_internal_request_list_t;
+typedef TAILQ_HEAD(mp_user_request_list_head_s, mp_user_request) mp_user_request_list_t;
 
 /*client resources*/
 typedef struct {
@@ -148,6 +192,11 @@ typedef struct {
    struct mp_request *posted_ipc_rreq;
    struct mp_request *last_processed_ipc_rreq;
    struct mp_request *processed_ipc_rreq;
+   /* tag */
+   mp_internal_request_list_t received_reqs;
+   mp_user_request_list_t tag_recv_user_reqs;
+   pthread_mutex_t tag_recv_user_reqs_mutex;
+   pthread_mutex_t mutex;
 } client_t;
 
 /*IB resources*/
@@ -163,41 +212,6 @@ struct mp_reg {
 
 struct CUstream_st;
 
-struct mp_request {
-   mp_req_type_t type;
-   int peer;
-   int status;
-   int trigger;
-   uint32_t id;
-   int flags;
-   bool has_tag;
-   mp_reg_t tag_reg;
-   mp_reg_t recv_reg;
-   mp_tag_state_t tag_state_host;
-   CUdeviceptr tag_state_device;
-   pthread_mutex_t mutex;
-   pthread_cond_t cond;
-   struct CUstream_st *stream;
-   union
-   {
-       struct ibv_recv_wr rr;
-       gds_send_wr sr;
-   } in;
-   union
-   {
-       gds_send_wr* bad_sr;
-       struct ibv_recv_wr* bad_rr;
-   } out;
-   struct ibv_sge sg_entry;
-   struct ibv_sge ud_sg_entry[2];
-   struct ibv_sge tag_sg_entry[2];
-   struct ibv_sge *sgv;
-   gds_send_request_t gds_send_info;
-   gds_wait_request_t gds_wait_info;
-   struct mp_request *next;
-   struct mp_request *prev;
-}; 
-
 struct mp_window {
    void **base_ptr;
    int size;
@@ -211,20 +225,6 @@ typedef struct mem_region {
   void *region;
   struct mem_region *next;
 } mem_region_t;
-
-typedef struct tag_buf_entry {
-    int tag;
-    size_t size;
-    void *req_buf;
-    struct tag_buf_entry *next;
-} tag_buf_entry_t;
-
-typedef struct request_entry {
-    mp_request_t req;
-    TAILQ_ENTRY(request_entry) ptrs;
-} request_entry_t;
-
-typedef TAILQ_HEAD(request_list_head_s, request_entry) request_list_t;
 
 #define MPI_CHECK(stmt)                                             \
 do {                                                                \
@@ -262,10 +262,23 @@ do {                                                    \
     assert(cudaSuccess == result);                      \
 } while (0)
 
+#define PTHREAD_ERROR_BUFFER_LENGTH 1024
+#define PTHREAD_CHECK(stmt)                                     \
+do {                                                            \
+    int errnum = (stmt);                                        \
+    if (errnum) {                                               \
+        mp_err_msg("[%s:%d] pthread failed with %d (%s)\n",     \
+            __FILE__, __LINE__, errnum, strerror(errnum));      \
+        exit(EXIT_FAILURE);                                     \
+    }                                                           \
+} while (0)
+
 extern client_t *clients;
 extern int *client_index;
 extern int ib_max_sge;
 extern int mp_enable_ipc;
+
+extern pthread_mutex_t global_mutex;
 
 extern int mpi_comm_rank;
 int mp_dbg_enabled();
@@ -309,6 +322,9 @@ int mp_warn_enabled();
 #define MIN(A,B) ((A)<(B)?(A):(B))
 #endif
 
+#define PTHREAD_LOCK(mutex) PTHREAD_CHECK(pthread_mutex_lock(&mutex))
+#define PTHREAD_UNLOCK(mutex) PTHREAD_CHECK(pthread_mutex_unlock(&mutex))
+
 extern int use_event_sync;
 extern int mp_enable_ud;
 
@@ -322,8 +338,10 @@ static inline struct mp_request *new_request(client_t *client, mp_req_type_t typ
 {
     return new_stream_request(client, type, state, 0);
 }
+struct mp_user_request *new_user_request(struct mp_request *internal_req);
 void release_mp_request(struct mp_request *req);
-void release_mp_request_tag_resources(struct mp_request *req);
+void release_mp_user_request(struct mp_user_request *req);
+// void release_mp_request_tag_resources(struct mp_request *req);
 
 //void init_req (struct mp_request *req);
 

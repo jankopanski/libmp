@@ -234,12 +234,15 @@ int mp_send_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
 {
     int ret = 0;
     struct mp_request *req = NULL;
+    struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *)*reg_t;
     client_t *client = &clients[client_index[peer]];
 
     if (use_event_sync) {
         req = new_stream_request(client, MP_SEND, MP_PREPARED, stream);
         assert(req);
+        user_req = new_user_request(req);
+        assert(user_req);
 
         req->in.sr.next = NULL;
         req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
@@ -320,6 +323,8 @@ int mp_send_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
 #endif
     } else {
         req = new_stream_request(client, MP_SEND, MP_PENDING, stream);
+        user_req = new_user_request(req);
+        assert(user_req);
 
         assert(req);
         req->in.sr.next = NULL;
@@ -355,7 +360,7 @@ int mp_send_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
         }
     }
 
-    *req_t = req; 
+    *req_t = user_req; 
 
 out:
     return ret; 
@@ -366,12 +371,15 @@ int mp_isend_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
 {
     int ret = 0;
     struct mp_request *req = NULL;
+    struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *)*reg_t;
     client_t *client = &clients[client_index[peer]];
 
     if (use_event_sync) {
         req = new_stream_request(client, MP_SEND, MP_PREPARED, stream);
         assert(req);
+        user_req = new_user_request(req);
+        assert(user_req);
 
         req->in.sr.next = NULL;
         req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
@@ -423,6 +431,8 @@ int mp_isend_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
     } else {
         req = new_stream_request(client, MP_SEND, MP_PENDING_NOWAIT, stream);
         assert(req);
+        user_req = new_user_request(req);
+        assert(user_req);
 
         mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
@@ -458,7 +468,7 @@ int mp_isend_on_stream (void *buf, int size, int peer, mp_reg_t *reg_t,
         }
     }
 
-    *req_t = req;
+    *req_t = user_req;
 
 out:
     return ret;
@@ -466,17 +476,21 @@ out:
 
 int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag, 
         mp_reg_t *reg_t, mp_request_t *req_t, cudaStream_t stream) {
-    // return mp_isend_on_stream(buf, size, peer, mp_reg, req, stream);
+    // pthread_mutex_lock(&global_mutex);
+    // mp_info_msg("acquire\n");
     int ret = 0;
     int *tag_buf = NULL;
     size_t tag_buf_size = sizeof(int);
     struct mp_request *req = NULL;
+    struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *)*reg_t;
     struct mp_reg *tag_buf_reg = NULL;
     client_t *client = &clients[client_index[peer]];
 
     mp_state_t state = use_event_sync ? MP_PREPARED : MP_PENDING_NOWAIT;
+    PTHREAD_LOCK(client->mutex);
     req = new_stream_request(client, MP_SEND, state, stream);
+    PTHREAD_UNLOCK(client->mutex);
     assert(req);
     mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
@@ -484,7 +498,7 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     if (!tag_buf) {
         mp_err_msg("cannot allocate memory\n");
         ret = ENOMEM;
-        goto out;
+        goto cleanup;
     }
     *tag_buf = tag;
     ret = mp_register(tag_buf, tag_buf_size, &tag_buf_reg);
@@ -492,8 +506,8 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         mp_err_msg("mp_register failed\n");
         goto cleanup;
     }
+
     req->tag_reg = tag_buf_reg;
-    req->has_tag = true;
 
     req->in.sr.next = NULL;
     req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
@@ -503,7 +517,8 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     req->in.sr.sg_list = req->tag_sg_entry;
 
     if (mp_enable_ud) {
-        mp_info_msg("UD is not available for tag messages\n");
+        mp_info_msg("UD is not supported for tag messages\n");
+        assert(0);
         // req->in.sr.wr.ud.ah = client->ah;
         // req->in.sr.wr.ud.remote_qpn = client->qpn;
         // req->in.sr.wr.ud.remote_qkey = 0;
@@ -514,9 +529,15 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     req->tag_sg_entry[0].addr = (uintptr_t) tag_buf;
     req->tag_sg_entry[1].length = size;
     req->tag_sg_entry[1].lkey = reg->key;
-    req->tag_sg_entry[1].addr = (uintptr_t)(buf);
+    req->tag_sg_entry[1].addr = (uintptr_t) buf;
 
+    user_req = new_user_request(req);
+    assert(user_req);
+    user_req->tag = tag;
+
+    PTHREAD_LOCK(client->mutex);
     if (use_event_sync) {
+        assert(0);
         client->last_posted_trigger_id[mp_type_to_flow(req->type)] = req->id;
 
 #if HAS_GDS_DESCRIPTOR_API
@@ -531,7 +552,7 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         if (ret) {
             mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
             // BUG: leaking req ??
-            goto cleanup;
+            goto unlock;
         }
         ret = gds_stream_post_descriptors(stream, n_descs, descs, 0);
 #else
@@ -543,7 +564,7 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         if (ret) {
             mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
             // BUG: leaking req ??
-            goto cleanup;
+            goto unlock;
         }
 
         client_track_posted_stream_req(client, req, TX_FLOW);
@@ -552,27 +573,32 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         if (ret) {
             mp_err_msg("mp_post_send_on_stream failed: %s \n", strerror(ret));
             // BUG: leaking req ??
-            goto cleanup;
+            goto unlock;
         }
 
         ret = gds_prepare_wait_cq(client->send_cq, &req->gds_wait_info, 0);
         if (ret) {
             mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(ret));
             // BUG: leaking req ??
-            goto cleanup;
+            goto unlock;
         }
     }
+    PTHREAD_UNLOCK(client->mutex);
 
-    *req_t = req;
+    *req_t = user_req;
     goto out;
 
+unlock:
+    PTHREAD_UNLOCK(client->mutex);
 cleanup:
-    release_mp_request_tag_resources(req);
+    // release_mp_request_tag_resources(req);
     // if (tag_buf_reg)
     //     mp_deregister(&tag_buf_reg);
     // if (tag_buf)
     //     free(tag_buf);
 out:
+    // pthread_mutex_unlock(&global_mutex);
+    // mp_info_msg("release\n");
     return ret;
 }
 
@@ -631,6 +657,7 @@ int mp_isendv_on_stream (struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t,
 {
   int i, ret = 0;
   struct mp_request *req = NULL;
+  struct mp_user_request *user_req = NULL;
   struct mp_reg *reg = (struct mp_reg *)*reg_t;
   client_t *client = &clients[client_index[peer]];
 
@@ -648,6 +675,8 @@ int mp_isendv_on_stream (struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t,
 
   req = new_stream_request(client, MP_SEND, MP_PENDING_NOWAIT, stream);
   assert(req);
+  user_req = new_user_request(req);
+  assert(user_req);
 
   req->sgv = malloc(sizeof(struct ibv_sge)*nvecs);
   assert(req->sgv);
@@ -686,7 +715,7 @@ int mp_isendv_on_stream (struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t,
     goto out;
   }
 
-  *req_t = req;
+  *req_t = user_req;
 
  out:
   return ret;
@@ -696,11 +725,14 @@ int mp_send_prepare(void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t
 {
     int ret = 0;
     struct mp_request *req;
+    struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *)*reg_t;
     client_t *client = &clients[client_index[peer]];
   
     req = new_stream_request(client, MP_SEND, MP_PREPARED, NULL);
     assert(req);
+    user_req = new_user_request(req);
+    assert(user_req);
 
     mp_dbg_msg(" preparing send message, req->id=%d \n", req->id);
 
@@ -758,7 +790,7 @@ int mp_send_prepare(void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t
         }
     }
 
-    *req_t = req;
+    *req_t = user_req;
 out:
     return ret;
 }
@@ -767,6 +799,7 @@ int mp_sendv_prepare(struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_r
 {
   int i, ret = 0;
   struct mp_request *req = NULL;
+  struct mp_user_request *user_req = NULL;
   struct mp_reg *reg = (struct mp_reg *)*reg_t;
   client_t *client = &clients[client_index[peer]];
 
@@ -784,6 +817,8 @@ int mp_sendv_prepare(struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_r
 
   req = new_stream_request(client, MP_SEND, MP_PREPARED, NULL);
   assert(req);
+  user_req = new_user_request(req);
+  assert(user_req);
 
   req->sgv = malloc(sizeof(struct ibv_sge)*nvecs);
   assert(req->sgv);
@@ -823,7 +858,7 @@ int mp_sendv_prepare(struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_r
       goto out;
   }
 
-  *req_t = req;
+  *req_t = user_req;
 
  out:
   return ret;
@@ -833,7 +868,8 @@ int mp_sendv_prepare(struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_r
 int mp_send_post_on_stream (mp_request_t *req_t, cudaStream_t stream)
 {
     int ret = 0;
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
 
     assert(req->status == MP_PREPARED);
 
@@ -930,8 +966,9 @@ out:
 int mp_isend_post_on_stream (mp_request_t *req_t, cudaStream_t stream)
 {
     int retcode;
-    int ret = 0; 
-    struct mp_request *req = *req_t;
+    int ret = 0;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
 
     assert(req->status == MP_PREPARED);
 
@@ -1000,7 +1037,8 @@ int mp_send_post_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream_
        gds_descriptor_t descs[2*count];
 
        for (i=0; i<count; i++) {
-  	   struct mp_request *req = req_t[i];
+           struct mp_user_request *user_req = req_t[i];
+           struct mp_request *req = user_req->internal_req;
            client_t *client = &clients[client_index[req->peer]];
 
            /*BUG: can requests passed to post_all be differnt from the order they were prepared?*/
@@ -1084,7 +1122,8 @@ int mp_send_post_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream_
        }
 
        for (i=0; i<count; i++) {
-           struct mp_request *req = req_t[i];
+           struct mp_user_request *user_req = req_t[i];
+           struct mp_request *req = user_req->internal_req;
            assert(req->status == MP_PREPARED);
 
            gds_send_request[i] = req->gds_send_info;
@@ -1128,7 +1167,8 @@ int mp_isend_post_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream
        gds_descriptor_t descs[2*count];
 
        for (i=0; i<count; i++) {
-  	   struct mp_request *req = req_t[i];
+           struct mp_user_request *user_req = req_t[i];
+           struct mp_request *req = user_req->internal_req;
            client_t *client = &clients[client_index[req->peer]];
 
 	   /*BUG: can requests passed to post_all be differnt from the order they were prepared?*/
@@ -1180,7 +1220,8 @@ int mp_isend_post_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream
         }
 
         for (i=0; i<count; i++) {
-            struct mp_request *req = req_t[i];
+            struct mp_user_request *user_req = req_t[i];
+            struct mp_request *req = user_req->internal_req;
 
             assert(req->status == MP_PREPARED);
 
@@ -1212,7 +1253,8 @@ int mp_wait_on_stream (mp_request_t *req_t, cudaStream_t stream)
 {
     assert(req_t);
     int ret = 0;
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
     client_t *client = &clients[client_index[req->peer]];
 
     mp_dbg_msg("req=%p status=%d id=%d\n", req, req->status, req->id);
@@ -1221,43 +1263,43 @@ int mp_wait_on_stream (mp_request_t *req_t, cudaStream_t stream)
         assert (req->type > 0);
 
         if (req->status == MP_COMPLETE) { 
-	    //request_complete, nothing to do
-	    goto out;
-	}
+            //request_complete, nothing to do
+            goto out;
+	    }
 
-	if (client->last_posted_tracked_id[mp_type_to_flow(req->type)] < req->id) { 
-	    client->last_posted_tracked_id[mp_type_to_flow(req->type)] = req->id;
-            req->trigger = 1;
+        if (client->last_posted_tracked_id[mp_type_to_flow(req->type)] < req->id) {
+            client->last_posted_tracked_id[mp_type_to_flow(req->type)] = req->id;
+                req->trigger = 1;
 #if HAS_GDS_DESCRIPTOR_API
-            size_t n_descs = 0;
-            gds_descriptor_t descs[1];
-            descs[n_descs].tag = GDS_TAG_WAIT_VALUE32;
-            ret = gds_prepare_wait_value32(&descs[n_descs].wait32,
-                                           &client->last_tracked_id[mp_type_to_flow(req->type)],
-                                           req->id,
-                                           GDS_WAIT_COND_GEQ,
-                                           GDS_MEMORY_HOST);
-            if (ret) {
-                    mp_err_msg("gds_prepare_wait_value32 failed: %s\n", strerror(ret));
-                    goto out;
-            }
-            ++n_descs;        
-            ret = gds_stream_post_descriptors(stream, n_descs, descs, 0);
+                size_t n_descs = 0;
+                gds_descriptor_t descs[1];
+                descs[n_descs].tag = GDS_TAG_WAIT_VALUE32;
+                ret = gds_prepare_wait_value32(&descs[n_descs].wait32,
+                                            &client->last_tracked_id[mp_type_to_flow(req->type)],
+                                            req->id,
+                                            GDS_WAIT_COND_GEQ,
+                                            GDS_MEMORY_HOST);
+                if (ret) {
+                        mp_err_msg("gds_prepare_wait_value32 failed: %s\n", strerror(ret));
+                        goto out;
+                }
+                ++n_descs;        
+                ret = gds_stream_post_descriptors(stream, n_descs, descs, 0);
 #else
-            ret = gds_stream_post_poll_dword(stream, 
-	    	&client->last_tracked_id[mp_type_to_flow(req->type)], 
-	    	req->id, 
-	    	GDS_WAIT_COND_GEQ,
-	    	GDS_MEMORY_HOST);
+                ret = gds_stream_post_poll_dword(stream, 
+                &client->last_tracked_id[mp_type_to_flow(req->type)], 
+                req->id, 
+                GDS_WAIT_COND_GEQ,
+                GDS_MEMORY_HOST);
 #endif
-            if (ret) {
-                mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
-                goto out;
-            }
-	}
+                if (ret) {
+                    mp_err_msg("gds_stream_queue_send failed: %s \n", strerror(ret));
+                    goto out;
+                }
+        }
     } else {
-	//TODO:Can this be skipped if the last CQE that stream is waiting on is later than this?
-	//     Similar to the event_sync case
+        //TODO:Can this be skipped if the last CQE that stream is waiting on is later than this?
+        //     Similar to the event_sync case
         //assert(req->status == MP_PENDING_NOWAIT);
         // cannot check wait-for-end more than once
 
@@ -1287,16 +1329,59 @@ out:
 int mp_wait_tag_on_stream (mp_request_t *req_t, cudaStream_t stream) {
     assert(req_t);
     int ret;
-    struct mp_request *req = *req_t;
-    assert(req->type == MP_SEND || req->type == MP_RECV);
-    ret = mp_wait_on_stream(req_t, stream);
-    if (!ret || req->type == MP_SEND) {
-        return ret;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
+    assert(user_req->type == MP_SEND || user_req->type == MP_RECV);
+    assert(req->status == MP_PENDING_NOWAIT || req->status == MP_COMPLETE);
+
+    assert(req->status != MP_COMPLETE);
+    if (req->status != MP_COMPLETE) {
+        if (!req_can_be_waited(req)) {
+            mp_dbg_msg("cannot wait req:%p status:%d id=%d peer=%d type=%d flags=%08x\n", req, req->status, req->id, req->peer, req->type, req->flags);
+            return EINVAL;
+        }
+        client_t *client = &clients[client_index[req->peer]];
+        // PTHREAD_LOCK(client->mutex);
+        req->stream = stream;
+        req->status = MP_PENDING;
+        ret = gds_stream_post_wait_cq(stream, &req->gds_wait_info);
+        // PTHREAD_UNLOCK(client->mutex);
+        if (ret) {
+            mp_err_msg("error %d(%s) in gds_stream_post_wait_cq\n", ret, strerror(ret));
+            return MP_FAILURE;
+        }
     }
-    CU_CHECK(cuStreamWaitValue32(stream, (CUdeviceptr) req->tag_state_device, 
-            (cuuint32_t) MP_TAG_MATCHED, CU_STREAM_WAIT_VALUE_EQ));
+
+    if (!user_req->completed_host) {
+        if (user_req->type == MP_RECV) {
+            CU_CHECK(cuStreamWaitValue32(
+                stream, (CUdeviceptr) user_req->completed_device, 
+                1, CU_STREAM_WAIT_VALUE_EQ
+            ));
+        }
+    }
+
     return MP_SUCCESS;
 }
+
+// int mp_wait_tag_on_stream (mp_request_t *req_t, cudaStream_t stream) {
+//     assert(req_t);
+//     int ret;
+//     struct mp_user_request *req = *req_t;
+//     assert(req->type == MP_SEND || req->type == MP_RECV);
+//     if (req->internal_req->status == MP_COMPLETE) {
+//         return MP_SUCCESS;
+//     }
+//     ret = mp_wait_on_stream(req_t, stream);
+//     if (ret || req->type == MP_SEND) {
+//         return ret;
+//     }
+//     assert(!req->type == MP_RECV);
+//     CU_CHECK(cuStreamWaitValue32(
+//         stream, (CUdeviceptr) req->completed_device, 1, CU_STREAM_WAIT_VALUE_EQ
+//     ));
+//     return MP_SUCCESS;
+// }
 
 /*----------------------------------------------------------------------------*/
 
@@ -1311,7 +1396,8 @@ int mp_wait_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream_t str
         size_t n_descs = 0;
         gds_descriptor_t descs[count];
         for (i=0; i<count; i++) {
-            struct mp_request *req = req_t[i];
+            struct mp_user_request *user_req = req_t[i];
+            struct mp_request *req = user_req->internal_req;
             client_t *client = &clients[client_index[req->peer]];
 
             assert (req->type > 0);
@@ -1363,7 +1449,8 @@ int mp_wait_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream_t str
         }
 
         for (i=0; i<count; i++) {
-            struct mp_request *req = req_t[i];
+            struct mp_user_request *user_req = req_t[i];
+            struct mp_request *req = user_req->internal_req;
             mp_dbg_msg("posting wait cq req=%p id=%d\n", req, req->id);
 
             if (!req_can_be_waited(req)) {
@@ -1404,6 +1491,7 @@ int mp_put_prepare (void *src, int size, mp_reg_t *reg_t, int peer, size_t displ
 {
   int ret = 0;
   struct mp_request *req = NULL;
+  struct mp_user_request *user_req = NULL;
   struct mp_reg *reg = *reg_t;
   struct mp_window *window = *window_t;
 
@@ -1420,6 +1508,8 @@ int mp_put_prepare (void *src, int size, mp_reg_t *reg_t, int peer, size_t displ
 
   req = new_stream_request(client, MP_RDMA, MP_PREPARED, NULL);
   assert(req);
+  user_req = new_user_request(req);
+  assert(user_req);
 
   mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
@@ -1465,7 +1555,7 @@ int mp_put_prepare (void *src, int size, mp_reg_t *reg_t, int peer, size_t displ
       }
   }
   
-  *req_t = req;
+  *req_t = user_req;
   
  out:
   if (ret) { 
@@ -1484,6 +1574,7 @@ int mp_iput_on_stream (void *src, int size, mp_reg_t *reg_t, int peer, size_t di
 {
   int ret = 0;
   struct mp_request *req = NULL;
+  struct mp_user_request *user_req = NULL;
   struct mp_reg *reg = *reg_t;
   struct mp_window *window = *window_t;
 
@@ -1500,6 +1591,8 @@ int mp_iput_on_stream (void *src, int size, mp_reg_t *reg_t, int peer, size_t di
 
   req = new_stream_request(client, MP_RDMA, MP_PENDING_NOWAIT, stream);
   assert(req);
+  user_req = new_user_request(req);
+  assert(user_req);
 
   mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
@@ -1544,7 +1637,7 @@ int mp_iput_on_stream (void *src, int size, mp_reg_t *reg_t, int peer, size_t di
           goto out;
       }
   }
-  *req_t = req;
+  *req_t = user_req;
 
  out:
   if (ret) { 
@@ -1563,6 +1656,7 @@ int mp_iget_on_stream (void *dst, int size, mp_reg_t *reg_t, int peer, size_t di
 {
   int ret = 0;
   struct mp_request *req;
+  struct mp_user_request *user_req = NULL;
   struct mp_reg *reg = *reg_t;
   struct mp_window *window = *window_t;
 
@@ -1579,6 +1673,8 @@ int mp_iget_on_stream (void *dst, int size, mp_reg_t *reg_t, int peer, size_t di
 
   req = new_stream_request(client, MP_RDMA, MP_PENDING_NOWAIT, stream);
   assert(req);
+  user_req = new_user_request(req);
+  assert(user_req);
 
   req->in.sr.next = NULL;
   req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
@@ -1607,7 +1703,7 @@ int mp_iget_on_stream (void *dst, int size, mp_reg_t *reg_t, int peer, size_t di
     goto out;
   }
 
-  *req_t = req;
+  *req_t = user_req;
 
  out:
   return ret;
@@ -1618,7 +1714,8 @@ int mp_iget_on_stream (void *dst, int size, mp_reg_t *reg_t, int peer, size_t di
 int mp_iput_post_on_stream (mp_request_t *req_t, cudaStream_t stream)
 {
     int ret = 0; 
-    struct mp_request *req = *req_t;
+    struct mp_user_request *user_req = *req_t;
+    struct mp_request *req = user_req->internal_req;
 
     assert(req->status == MP_PREPARED);
 
@@ -1662,7 +1759,8 @@ int mp_iput_post_all_on_stream (uint32_t count, mp_request_t *req_t, cudaStream_
     }
 
     for (i=0; i<count; i++) {
-        struct mp_request *req = req_t[i];
+        struct mp_user_request *user_req = req_t[i];
+        struct mp_request *req = user_req->internal_req;
 
         assert(req->status == MP_PREPARED);
         req->status = MP_PENDING_NOWAIT;
