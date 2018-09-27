@@ -135,6 +135,7 @@ int mp_post_send_on_stream(cudaStream_t stream, client_t *client, struct mp_requ
         ret = gds_stream_queue_send(stream, client->qp, &req->in.sr, &req->out.bad_sr);
         if(ret == ENOMEM)
         {
+            assert(0);
             if(qp_query == 0)
             {
                 mp_query_print_qp(client->qp, req, 1);
@@ -479,35 +480,38 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     // pthread_mutex_lock(&global_mutex);
     // mp_info_msg("acquire\n");
     int ret = 0;
-    int *tag_buf = NULL;
-    size_t tag_buf_size = sizeof(int);
+    // int *tag_buf = NULL;
+    struct ibv_exp_tmh *tmh = NULL;
+    // size_t tag_buf_size = sizeof(int);
     struct mp_request *req = NULL;
     struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *)*reg_t;
-    struct mp_reg *tag_buf_reg = NULL;
+    struct mp_reg *tmh_reg = NULL;
     client_t *client = &clients[client_index[peer]];
 
     mp_state_t state = use_event_sync ? MP_PREPARED : MP_PENDING_NOWAIT;
-    PTHREAD_LOCK(client->mutex);
+    // PTHREAD_LOCK(client->mutex);
     req = new_stream_request(client, MP_SEND, state, stream);
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
     assert(req);
     mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
-    tag_buf = (int *) malloc(tag_buf_size);
-    if (!tag_buf) {
+    tmh = (struct ibv_exp_tmh *) malloc(sizeof(struct ibv_exp_tmh));
+    if (!tmh) {
         mp_err_msg("cannot allocate memory\n");
         ret = ENOMEM;
         goto cleanup;
     }
-    *tag_buf = tag;
-    ret = mp_register(tag_buf, tag_buf_size, &tag_buf_reg);
+
+    ret = mp_register(tmh, sizeof(struct ibv_exp_tmh), &tmh_reg);
     if (ret) {
         mp_err_msg("mp_register failed\n");
         goto cleanup;
     }
 
-    req->tag_reg = tag_buf_reg;
+    tmh->opcode = IBV_EXP_TMH_EAGER;
+    tmh->tag = htobe64(tag);
+    req->tmh_reg = tmh_reg;
 
     req->in.sr.next = NULL;
     req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
@@ -524,9 +528,9 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
         // req->in.sr.wr.ud.remote_qkey = 0;
     }
 
-    req->tag_sg_entry[0].length = tag_buf_size;
-    req->tag_sg_entry[0].lkey = tag_buf_reg->key;
-    req->tag_sg_entry[0].addr = (uintptr_t) tag_buf;
+    req->tag_sg_entry[0].length = sizeof(struct ibv_exp_tmh);
+    req->tag_sg_entry[0].lkey = tmh_reg->key;
+    req->tag_sg_entry[0].addr = (uintptr_t) tmh;
     req->tag_sg_entry[1].length = size;
     req->tag_sg_entry[1].lkey = reg->key;
     req->tag_sg_entry[1].addr = (uintptr_t) buf;
@@ -535,9 +539,9 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
     assert(user_req);
     user_req->tag = tag;
 
-    PTHREAD_LOCK(client->mutex);
+    // PTHREAD_LOCK(client->mutex);
     if (use_event_sync) {
-        assert(0);
+        assert(0 && "implementation not supported");
         client->last_posted_trigger_id[mp_type_to_flow(req->type)] = req->id;
 
 #if HAS_GDS_DESCRIPTOR_API
@@ -583,13 +587,13 @@ int mp_isend_tag_on_stream (void *buf, int size, int peer, int tag,
             goto unlock;
         }
     }
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
 
     *req_t = user_req;
     goto out;
 
 unlock:
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
 cleanup:
     // release_mp_request_tag_resources(req);
     // if (tag_buf_reg)
@@ -1340,7 +1344,7 @@ int mp_wait_tag_on_stream (mp_request_t *req_t, cudaStream_t stream) {
             mp_dbg_msg("cannot wait req:%p status:%d id=%d peer=%d type=%d flags=%08x\n", req, req->status, req->id, req->peer, req->type, req->flags);
             return EINVAL;
         }
-        client_t *client = &clients[client_index[req->peer]];
+        // client_t *client = &clients[client_index[req->peer]];
         // PTHREAD_LOCK(client->mutex);
         req->stream = stream;
         req->status = MP_PENDING;

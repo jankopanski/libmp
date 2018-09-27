@@ -53,6 +53,8 @@
 
 #define DADO_DEBUG
 
+#define MP_UD 0
+
 int mp_dbg_is_enabled = -1;
 int use_event_sync = 0;
 int mp_enable_ud = 0;
@@ -408,16 +410,16 @@ int mp_progress_single_flow(mp_flow_t flow)
 {
     int i, ne = 0, ret = 0;
     struct gds_cq *cq = NULL; 
-    static struct ibv_wc *wc = NULL;
+    static struct ibv_exp_wc *wc = NULL;
     int cqe_count = 0;
 
     if (!wc) {
-        wc = malloc(sizeof(struct ibv_wc)*cq_poll_count);
+        wc = malloc(sizeof(struct ibv_exp_wc)*cq_poll_count);
     }
 
     const char *flow_str = mp_flow_to_str(flow);
 
-    //mp_dbg_msg("flow=%s\n", flow_str);
+    // mp_dbg_msg("flow=%s\n", flow_str);
 
     progress_posted_list(flow);
 
@@ -433,8 +435,8 @@ int mp_progress_single_flow(mp_flow_t flow)
             mp_dbg_msg("cannot poll client[%d] flow=%s\n", client->mpi_rank, flow_str);
             continue;
         }
-        ne = ibv_poll_cq(cq->cq, cqe_count, wc);
-        //mp_dbg_msg("client[%d] flow=%s cqe_count=%d nw=%d\n", client->mpi_rank, flow_str, cqe_count, ne);
+        ne = ibv_exp_poll_cq(cq->cq, cqe_count, wc, sizeof(*wc));
+        // mp_dbg_msg("client[%d] flow=%s cqe_count=%d nw=%d cq %p\n", client->mpi_rank, flow_str, cqe_count, ne, cq->cq);
         if (ne == 0) {
             //if (errno) mp_dbg_msg("client[%d] flow=%s errno=%s\n", client->mpi_rank, flow_str, strerror(errno));
         }
@@ -445,11 +447,11 @@ int mp_progress_single_flow(mp_flow_t flow)
         } else if (ne) {
             int j;
             for (j=0; j<ne; j++) {
-                struct ibv_wc *wc_curr = wc + j;
+                struct ibv_exp_wc *wc_curr = wc + j;
                 mp_dbg_msg("client:%d wc[%d]: status=%x(%s) opcode=%x byte_len=%d wr_id=%"PRIx64"\n",
                            client->mpi_rank, j,
                            wc_curr->status, ibv_wc_status_str(wc_curr->status), 
-                           wc_curr->opcode, wc_curr->byte_len, wc_curr->wr_id);
+                           wc_curr->exp_opcode, wc_curr->byte_len, wc_curr->wr_id);
 
                 struct mp_request *req = (struct mp_request *) wc_curr->wr_id;
 
@@ -870,6 +872,40 @@ int mp_deregister(mp_reg_t *reg_)
   return MP_SUCCESS;
 }
 
+void prepost_unexpected_buffer(struct gds_qp *gqp, struct ibv_pd *pd) {
+    uint32_t size = 1024;
+
+    void *unexp_buf = malloc(size);
+    assert(unexp_buf);
+
+    struct ibv_mr *unexp_mr = ibv_reg_mr(pd, unexp_buf, size,
+                                    IBV_ACCESS_LOCAL_WRITE |
+                                    IBV_ACCESS_REMOTE_READ |
+                                    IBV_ACCESS_REMOTE_WRITE);
+    assert(unexp_mr);
+
+    struct ibv_sge list = {
+		.addr	= (uintptr_t) unexp_buf,
+		.length = size,
+		.lkey	= unexp_mr->lkey
+	};
+
+    struct ibv_recv_wr wr = {
+		.wr_id	    = 0,
+		.sg_list    = &list,
+		.num_sge    = 1,
+	};
+
+    struct ibv_recv_wr *bad_wr;
+
+    for (int i = 0; i < 33; ++i) {
+		if (ibv_post_srq_recv(gqp->srq, &wr, &bad_wr)) {
+			fprintf(stderr, "Couldn't post unexpected receive\n");
+			exit(-1);
+		}
+	}
+}
+
 char shm_filename[100];
 int shm_fd;
 int shm_client_bufsize;
@@ -888,11 +924,13 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
   char *req_dev = NULL;
 
   struct ibv_qp_attr ib_qp_attr;
+#if MP_UD
   struct ibv_ah_attr ib_ah_attr;
+#endif
   int peer;
   int gds_flags, comm_size, comm_rank;
   qpinfo_t *qpinfo_all;
-  struct ibv_device_attr dev_attr;
+  struct ibv_exp_device_attr dev_attr;
   int ret = MP_SUCCESS;
 
   if(gpu_id < 0)
@@ -991,6 +1029,8 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
       return MP_FAILURE;
   }
 
+  assert(!mp_enable_ud && "Tag-matching is initially defined for RC transport");
+
   finalized = false;
   client_count = count;
 
@@ -1033,15 +1073,29 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
   }
 
   /*get device attributes and check relevant leimits*/
-  if (ibv_query_device(ib_ctx->context, &dev_attr)) {
+  memset(&dev_attr, 0, sizeof(dev_attr));
+  dev_attr.comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1;
+  if (ibv_exp_query_device(ib_ctx->context, &dev_attr)) {
     mp_err_msg("query_device failed \n"); 	 
     return MP_FAILURE;	
   }
+
+  if (!dev_attr.tm_caps.max_num_tags ||
+	    !(dev_attr.tm_caps.capability_flags & IBV_EXP_TM_CAP_RC)) {
+		mp_err_msg("Tag matching not supported\n");
+		return MP_FAILURE;	
+  }
+
 
   if (ib_max_sge > dev_attr.max_sge) {
       mp_err_msg("warning!! requested sgl length longer than supported by the adapter, reverting to max, requested: %d max: %d \n", ib_max_sge, dev_attr.max_sge);
       ib_max_sge = dev_attr.max_sge;
   }
+//   if (ib_max_sge > dev_attr.max_sge || ib_max_sge > dev_attr.tm_caps.max_sge) {
+//       uint32_t max_sge = MIN(dev_attr.max_sge, dev_attr.tm_caps.max_sge);
+//       mp_err_msg("warning!! requested sgl length longer than supported by the adapter, reverting to max, requested: %d max: %d \n", ib_max_sge, max_sge);
+//       ib_max_sge = max_sge;
+//   }
 
   ib_ctx->pd = ibv_alloc_pd (ib_ctx->context);
   if (ib_ctx->pd == NULL) {
@@ -1106,10 +1160,14 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
 
       gds_qp_init_attr_t ib_qp_init_attr;
       memset(&ib_qp_init_attr, 0, sizeof(ib_qp_init_attr));
-      ib_qp_init_attr.cap.max_send_wr  = ib_tx_depth;
-      ib_qp_init_attr.cap.max_recv_wr  = ib_rx_depth;
-      ib_qp_init_attr.cap.max_send_sge = ib_max_sge;
-      ib_qp_init_attr.cap.max_recv_sge = ib_max_sge;
+      ib_qp_init_attr.cap.max_send_wr  = 10;
+    //   ib_qp_init_attr.cap.max_send_wr  = ib_tx_depth;
+      ib_qp_init_attr.cap.max_recv_wr  = 10;
+      ib_qp_init_attr.cap.max_send_sge = 2;
+      ib_qp_init_attr.cap.max_recv_sge = 1;
+    //   ib_qp_init_attr.cap.max_recv_wr  = ib_rx_depth;
+    //   ib_qp_init_attr.cap.max_send_sge = ib_max_sge;
+    //   ib_qp_init_attr.cap.max_recv_sge = ib_max_sge;
 
       //create QP, set to INIT state and exchange QPN information
       if (mp_enable_ud) {
@@ -1131,7 +1189,7 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
           gds_flags |= GDS_CREATE_QP_WQ_DBREC_ON_GPU;
 
       //is the CUDA context already initialized?
-      clients[i].qp = gds_create_qp(ib_ctx->pd, ib_ctx->context, &ib_qp_init_attr, gpu_id, gds_flags);
+      clients[i].qp = gds_create_qp(&dev_attr, ib_ctx->pd, ib_ctx->context, &ib_qp_init_attr, gpu_id, gds_flags);
       if (clients[i].qp == NULL) {
           mp_err_msg("qp creation failed \n");
           return MP_FAILURE;
@@ -1156,20 +1214,30 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
           flags                      = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
       }
 
-      ret = ibv_modify_qp (clients[i].qp->qp, &ib_qp_attr, flags);
+      ret = ibv_modify_qp (clients[i].qp->send_qp, &ib_qp_attr, flags);
       if (ret != 0) {
-          mp_err_msg("Failed to modify QP to INIT: %d, %s\n", ret, strerror(errno));
+          mp_err_msg("Failed to modify send QP to INIT: %d, %s\n", ret, strerror(errno));
           exit(EXIT_FAILURE);
       }
+      ret = ibv_modify_qp (clients[i].qp->recv_qp, &ib_qp_attr, flags);
+      if (ret != 0) {
+          mp_err_msg("Failed to modify recv QP to INIT: %d, %s\n", ret, strerror(errno));
+          exit(EXIT_FAILURE);
+      }
+
+      // post 33 receives for unexpected message
+      prepost_unexpected_buffer(clients[i].qp, ib_ctx->pd);
 
 //      mp_query_print_qp(clients[i].qp, NULL, 0);
 
       qpinfo_all[peer].lid = ib_port_attr.lid;
-      qpinfo_all[peer].qpn = clients[i].qp->qp->qp_num;
+      qpinfo_all[peer].send_qpn = clients[i].qp->send_qp->qp_num;
+      qpinfo_all[peer].recv_qpn = clients[i].qp->recv_qp->qp_num;
       qpinfo_all[peer].psn = 0;
-      mp_dbg_msg("QP lid:%04x qpn:%06x psn:%06x\n", 
+      mp_dbg_msg("QP lid:%04x send_qpn:%06x recv_qpn:%06x psn:%06x\n", 
                  qpinfo_all[peer].lid,
-                 qpinfo_all[peer].qpn,
+                 qpinfo_all[peer].send_qpn,
+                 qpinfo_all[peer].recv_qpn,
                  qpinfo_all[peer].psn);
   }
 
@@ -1189,7 +1257,7 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
       } else { 
           ib_qp_attr.qp_state       = IBV_QPS_RTR;
           ib_qp_attr.path_mtu       = ib_port_attr.active_mtu;
-          ib_qp_attr.dest_qp_num    = qpinfo_all[peer].qpn;
+          ib_qp_attr.dest_qp_num    = qpinfo_all[peer].recv_qpn;
           ib_qp_attr.rq_psn         = qpinfo_all[peer].psn;
           ib_qp_attr.ah_attr.dlid   = qpinfo_all[peer].lid;
           ib_qp_attr.max_dest_rd_atomic     = 1;
@@ -1203,9 +1271,17 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
               | IBV_QP_MIN_RNR_TIMER | IBV_QP_MAX_DEST_RD_ATOMIC;
       }
 
-      ret = ibv_modify_qp(clients[i].qp->qp, &ib_qp_attr, flags);
+      ret = ibv_modify_qp(clients[i].qp->send_qp, &ib_qp_attr, flags);
       if (ret != 0) {
-          mp_err_msg("Failed to modify RC QP to RTR\n");
+          mp_err_msg("Failed to modify send RC QP to RTR\n");
+          return MP_FAILURE;
+      }
+
+      ib_qp_attr.dest_qp_num = qpinfo_all[peer].send_qpn;
+
+      ret = ibv_modify_qp(clients[i].qp->recv_qp, &ib_qp_attr, flags);
+      if (ret != 0) {
+          mp_err_msg("Failed to modify recv RC QP to RTR\n");
           return MP_FAILURE;
       }
   }
@@ -1233,13 +1309,21 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
             | IBV_QP_MAX_QP_RD_ATOMIC;
       }
 
-      ret = ibv_modify_qp(clients[i].qp->qp, &ib_qp_attr, flags);
+      ret = ibv_modify_qp(clients[i].qp->send_qp, &ib_qp_attr, flags);
       if (ret != 0)
       {
-        mp_err_msg("Failed to modify RC QP to RTS\n");
+        mp_err_msg("Failed to modify send RC QP to RTS\n");
         return MP_FAILURE;
       }
 
+      ret = ibv_modify_qp(clients[i].qp->recv_qp, &ib_qp_attr, flags);
+      if (ret != 0)
+      {
+        mp_err_msg("Failed to modify recv RC QP to RTS\n");
+        return MP_FAILURE;
+      }
+
+#if MP_UD
       if (mp_enable_ud) {
           mp_err_msg("setting up connection with peer: %d lid: %d qpn: %d \n", peer, qpinfo_all[peer].lid,
                          qpinfo_all[peer].qpn);
@@ -1259,6 +1343,7 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
 
           clients[i].qpn = qpinfo_all[peer].qpn; 
       }
+#endif
   }
 
   if (mp_enable_ud) { 
@@ -1399,23 +1484,23 @@ int mp_init (MPI_Comm comm, int *peers, int count, int init_flags, int gpu_id)
       }
   }
 
-  for (i = 0; i < count; i++) {
-      TAILQ_INIT(&clients[i].received_reqs);
-      TAILQ_INIT(&clients[i].tag_recv_user_reqs);
-  }
-  for (i = 0; i < count; i++) {
-      ret = pthread_mutex_init(&clients[i].tag_recv_user_reqs_mutex, NULL);
-      if (ret) {
-          mp_err_msg("pthread_mutex_init returned error %d\n", ret);
-          return MP_FAILURE;
-      }
-      PTHREAD_CHECK(pthread_mutex_init(&clients[i].mutex, NULL));
-  }
-  ret = pthread_create(&tag_matcher_thread, NULL, tag_matcher_function, NULL);
-  if (ret) {
-      mp_err_msg("pthread_create returned error %d\n", ret);
-      return MP_FAILURE;
-  }
+//   for (i = 0; i < count; i++) {
+//       TAILQ_INIT(&clients[i].received_reqs);
+//       TAILQ_INIT(&clients[i].tag_recv_user_reqs);
+//   }
+//   for (i = 0; i < count; i++) {
+//       ret = pthread_mutex_init(&clients[i].tag_recv_user_reqs_mutex, NULL);
+//       if (ret) {
+//           mp_err_msg("pthread_mutex_init returned error %d\n", ret);
+//           return MP_FAILURE;
+//       }
+//       PTHREAD_CHECK(pthread_mutex_init(&clients[i].mutex, NULL));
+//   }
+//   ret = pthread_create(&tag_matcher_thread, NULL, tag_matcher_function, NULL);
+//   if (ret) {
+//       mp_err_msg("pthread_create returned error %d\n", ret);
+//       return MP_FAILURE;
+//   }
 
   free(qpinfo_all);
 
@@ -1430,10 +1515,10 @@ void mp_finalize ()
   MPI_Barrier(mpi_comm);
 
   finalized = true;
-  ret = pthread_join(tag_matcher_thread, NULL);
-  if (ret) {
-      mp_warn_msg("pthread_join return error %d\n", ret);
-  }
+//   ret = pthread_join(tag_matcher_thread, NULL);
+//   if (ret) {
+//       mp_warn_msg("pthread_join return error %d\n", ret);
+//   }
   for (i = 0; i < client_count; i++) {
       ret = pthread_mutex_destroy(&clients[i].tag_recv_user_reqs_mutex);
       if (ret) {
@@ -1501,6 +1586,71 @@ int mp_post_recv(client_t *client, struct mp_request *req)
     return ret;
 }
 
+// int mp_irecv (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_t)
+// {
+// //     assert(0);
+// // #if 0
+//   int ret = 0;
+//   //int ret_progress = 0;
+//   struct mp_request *req = NULL;
+//   struct mp_user_request *user_req = NULL;
+//   struct mp_reg *reg = (struct mp_reg *) *reg_t;
+//   client_t *client = &clients[client_index[peer]];
+
+//   req = new_request(client, MP_RECV, MP_PENDING_NOWAIT);
+//   assert(req);
+//   user_req = new_user_request(req);
+//   assert(user_req);
+
+//   mp_dbg_msg("peer=%d req=%p buf=%p size=%d id=%d reg=%p key=%x\n", peer, req, buf, size, req->id, reg, reg->key);
+
+//   if (mp_enable_ipc && client->can_use_ipc) {
+//       track_ipc_stream_rreq(peer, req);
+//   } else { 
+//       req->in.rr.next = NULL;
+//       req->in.rr.wr_id = (uintptr_t) req;
+
+//       if (mp_enable_ud) { 
+//           struct mp_reg *ud_reg = (struct mp_reg *) ud_padding_reg;
+
+//           req->in.rr.num_sge = 2;
+//           req->in.rr.sg_list = req->ud_sg_entry;
+//           req->ud_sg_entry[0].length = UD_ADDITION;
+//           req->ud_sg_entry[0].lkey = ud_reg->key;
+//           req->ud_sg_entry[0].addr = (uintptr_t)(ud_padding);
+//           req->ud_sg_entry[1].length = size;
+//           req->ud_sg_entry[1].lkey = reg->key;
+//           req->ud_sg_entry[1].addr = (uintptr_t)(buf);	
+//       } else { 
+//           req->in.rr.num_sge = 1;
+//           req->in.rr.sg_list = &req->sg_entry;
+//           req->sg_entry.length = size;
+//           req->sg_entry.lkey = reg->key;
+//           req->sg_entry.addr = (uintptr_t)(buf);
+//       }
+//       //progress (remove) some request on the RX flow if is not possible to queue a recv request
+//       ret = mp_post_recv(client, req);
+//       if (ret) {
+//         mp_err_msg("posting recv failed ret: %d error: %s peer: %d index: %d \n", ret, strerror(errno), peer, client_index[peer]);
+//         goto out;
+//       }
+
+//       if (!use_event_sync) {
+//           ret = gds_prepare_wait_cq(client->recv_cq, &req->gds_wait_info, 0);
+//           if (ret) {
+//             mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
+//             goto out;
+//           }
+//       }
+//   }
+
+//   *req_t = user_req; 
+
+//  out:
+//   return ret;
+// // #endif
+// }
+
 int mp_irecv (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_t)
 {
   int ret = 0;
@@ -1517,45 +1667,34 @@ int mp_irecv (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_
 
   mp_dbg_msg("peer=%d req=%p buf=%p size=%d id=%d reg=%p key=%x\n", peer, req, buf, size, req->id, reg, reg->key);
 
-  if (mp_enable_ipc && client->can_use_ipc) {
-      track_ipc_stream_rreq(peer, req);
-  } else { 
-      req->in.rr.next = NULL;
-      req->in.rr.wr_id = (uintptr_t) req;
+    req->in.rr.next = NULL;
+    req->in.rr.wr_id = (uintptr_t) req;
+    req->in.rr.opcode = IBV_EXP_WR_TAG_ADD;
+    req->in.rr.flags = IBV_EXP_OPS_SIGNALED | IBV_EXP_OPS_TM_SYNC;
+    req->in.rr.tm.unexpected_cnt = 0;
+    req->in.rr.tm.add.recv_wr_id = (uintptr_t) req;
+    req->in.rr.tm.add.sg_list = &req->sg_entry;
+    req->in.rr.tm.add.num_sge = 1;
+    req->in.rr.tm.add.tag = 42;
+    req->in.rr.tm.add.mask = 0xffff;
 
-      if (mp_enable_ud) { 
-          struct mp_reg *ud_reg = (struct mp_reg *) ud_padding_reg;
+    req->sg_entry.length = size;
+    req->sg_entry.lkey = reg->key;
+    req->sg_entry.addr = (uintptr_t)(buf);
+    //progress (remove) some request on the RX flow if is not possible to queue a recv request
+    ret = mp_post_recv(client, req);
+    if (ret) {
+    mp_err_msg("posting recv failed ret: %d error: %s peer: %d index: %d \n", ret, strerror(errno), peer, client_index[peer]);
+    goto out;
+    }
 
-          req->in.rr.num_sge = 2;
-          req->in.rr.sg_list = req->ud_sg_entry;
-          req->ud_sg_entry[0].length = UD_ADDITION;
-          req->ud_sg_entry[0].lkey = ud_reg->key;
-          req->ud_sg_entry[0].addr = (uintptr_t)(ud_padding);
-          req->ud_sg_entry[1].length = size;
-          req->ud_sg_entry[1].lkey = reg->key;
-          req->ud_sg_entry[1].addr = (uintptr_t)(buf);	
-      } else { 
-          req->in.rr.num_sge = 1;
-          req->in.rr.sg_list = &req->sg_entry;
-          req->sg_entry.length = size;
-          req->sg_entry.lkey = reg->key;
-          req->sg_entry.addr = (uintptr_t)(buf);
-      }
-      //progress (remove) some request on the RX flow if is not possible to queue a recv request
-      ret = mp_post_recv(client, req);
-      if (ret) {
-        mp_err_msg("posting recv failed ret: %d error: %s peer: %d index: %d \n", ret, strerror(errno), peer, client_index[peer]);
+    if (!use_event_sync) {
+        ret = gds_prepare_wait_cq(client->recv_cq, &req->gds_wait_info, 0);
+        if (ret) {
+        mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
         goto out;
-      }
-
-      if (!use_event_sync) {
-          ret = gds_prepare_wait_cq(client->recv_cq, &req->gds_wait_info, 0);
-          if (ret) {
-            mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
-            goto out;
-          }
-      }
-  }
+        }
+    }
 
   *req_t = user_req; 
 
@@ -1568,85 +1707,46 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
     // mp_info_msg("acquire\n");
     int ret = 0;
     //int ret_progress = 0;
-    int *tag_buf = NULL;
-    void *tmp_buf = NULL;
-    size_t tag_buf_size = sizeof(int);
     struct mp_request *req = NULL;
     struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *) *reg_t;
-    struct mp_reg *tag_buf_reg = NULL;
-    struct mp_reg *tmp_buf_reg = NULL;
     client_t *client = &clients[client_index[peer]];
 
-    PTHREAD_LOCK(client->mutex);
+    assert(!mp_enable_ud);
+
+    // PTHREAD_LOCK(client->mutex);
     req = new_request(client, MP_RECV, MP_PENDING_NOWAIT);
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
     assert(req);
 
     mp_dbg_msg("peer=%d req=%p buf=%p size=%d id=%d reg=%p key=%x\n", peer, req, buf, size, req->id, reg, reg->key);
-
-    tag_buf = (int *) malloc(tag_buf_size);
-    if (!tag_buf) {
-        mp_err_msg("cannot allocate memory\n");
-        ret = ENOMEM;
-        goto cleanup;
-    }
-    *tag_buf = tag;
-    ret = mp_register(tag_buf, tag_buf_size, &tag_buf_reg);
-    if (ret) {
-        mp_err_msg("mp_register failed\n");
-        goto cleanup;
-    }
-
-    CUDA_CHECK(cudaMalloc(&tmp_buf, size));
-    // mp_info_msg("tmp_buf alloc address: %p\n", tmp_buf);
-    ret = mp_register(tmp_buf, size, &tmp_buf_reg);
-    if (ret) {
-        mp_err_msg("mp_register failed\n");
-        goto cleanup;
-    }
-    // mp_info_msg("tmp_buf reg address: %p\n", tmp_buf_reg);
-
-    req->tag_reg = tag_buf_reg;
-    req->tmp_reg = tmp_buf_reg;
-
-    req->in.rr.next = NULL;
-    req->in.rr.wr_id = (uintptr_t) req;
 
     user_req = new_user_request(req);
     assert(user_req);
     user_req->tag = tag;
     user_req->size = size;
     user_req->user_buf = buf;
-    CUDA_CHECK(cudaMalloc((void **) &user_req->completed_device, sizeof(cuuint32_t)));
-    CUDA_CHECK(cudaMemset((void *) user_req->completed_device, 0, sizeof(cuuint32_t)));
+    // CUDA_CHECK(cudaMalloc((void **) &user_req->completed_device, sizeof(cuuint32_t)));
+    // CUDA_CHECK(cudaMemset((void *) user_req->completed_device, 0, sizeof(cuuint32_t)));
 
     // mp_info_msg("irecv req: %p user_req: %p, user_tag: %d\n", req, user_req, user_req->tag);
 
-    if (mp_enable_ud) {
-        mp_info_msg("UD is not available for tag messages\n"); 
-        // struct mp_reg *ud_reg = (struct mp_reg *) ud_padding_reg;
+    req->in.rr.next = NULL;
+    req->in.rr.wr_id = (uintptr_t) req;
+    req->in.rr.opcode = IBV_EXP_WR_TAG_ADD;
+    req->in.rr.flags = IBV_EXP_OPS_TM_SYNC;
+    req->in.rr.tm.unexpected_cnt = 0; // TODO add unexpected message counter
+    req->in.rr.tm.add.recv_wr_id = (uintptr_t) req;
+    req->in.rr.tm.add.num_sge = 1;
+    req->in.rr.tm.add.sg_list = req->tag_sg_entry;
+    req->in.rr.tm.add.tag = tag;
+    // req->in.rr.tm.add.mask = 0xffff;
+    req->in.rr.tm.add.mask = 0;
+    req->tag_sg_entry[0].length = size;
+    req->tag_sg_entry[0].lkey = reg->key;
+    req->tag_sg_entry[0].addr = (uintptr_t)(buf);
 
-        // req->in.rr.num_sge = 2;
-        // req->in.rr.sg_list = req->ud_sg_entry;
-        // req->ud_sg_entry[0].length = UD_ADDITION;
-        // req->ud_sg_entry[0].lkey = ud_reg->key;
-        // req->ud_sg_entry[0].addr = (uintptr_t)(ud_padding);
-        // req->ud_sg_entry[1].length = size;
-        // req->ud_sg_entry[1].lkey = reg->key;
-        // req->ud_sg_entry[1].addr = (uintptr_t)(buf);	
-    } else { 
-        req->in.rr.num_sge = 2;
-        req->in.rr.sg_list = req->tag_sg_entry;
-        req->tag_sg_entry[0].length = tag_buf_size;
-        req->tag_sg_entry[0].lkey = tag_buf_reg->key;
-        req->tag_sg_entry[0].addr = (uintptr_t)(tag_buf);
-        req->tag_sg_entry[1].length = size;
-        req->tag_sg_entry[1].lkey = tmp_buf_reg->key;
-        req->tag_sg_entry[1].addr = (uintptr_t)(tmp_buf);
-    }
-
-    PTHREAD_LOCK(client->mutex);
+    // PTHREAD_LOCK(client->mutex);
     //progress (remove) some request on the RX flow if is not possible to queue a recv request
     ret = mp_post_recv(client, req);
     if (ret) {
@@ -1661,13 +1761,13 @@ int mp_irecv_tag (void *buf, int size, int peer, int tag, mp_reg_t *reg_t, mp_re
             goto unlock;
         }
     }
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
 
     *req_t = user_req;
     goto out;
 
 unlock:
-    PTHREAD_UNLOCK(client->mutex);
+    // PTHREAD_UNLOCK(client->mutex);
 cleanup:
     // if (tag_buf_reg)
     //     mp_deregister(&tag_buf_reg);
@@ -1686,6 +1786,8 @@ out:
 
 int mp_irecvv (struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_request_t *req_t)
 {
+    assert(0);
+#if 0
   int i, ret = 0;
   struct mp_request *req = NULL;
   struct mp_user_request *user_req = NULL;
@@ -1738,6 +1840,7 @@ int mp_irecvv (struct iovec *v, int nvecs, int peer, mp_reg_t *reg_t, mp_request
 
  out:
   return ret;
+#endif
 }
 
 static int qp_query=0;
@@ -1779,6 +1882,100 @@ int mp_post_send(client_t *client, struct mp_request *req)
     return ret;
 }
 
+// int mp_isend (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_t)
+// {
+//     int ret = 0;
+//     //int progress_retry = 0;
+//     //int ret_progress = 0;
+//     struct mp_request *req;
+//     struct mp_user_request *user_req = NULL;
+//     struct mp_reg *reg = (struct mp_reg *) *reg_t;
+
+//     client_t *client = &clients[client_index[peer]];
+
+//     req = new_request(client, MP_SEND, MP_PENDING_NOWAIT);
+//     assert(req);
+//     user_req = new_user_request(req);
+//     assert(user_req);
+
+//     mp_dbg_msg("req=%p id=%d\n", req, req->id);
+
+//     if (mp_enable_ipc && client->can_use_ipc)
+//     {
+//         ipc_handle_cache_entry_t *entry = NULL;
+//         smp_buffer_t *smp_buffer = NULL;
+
+//         //try to find in local handle cache
+//         ipc_handle_cache_find (buf, size, &entry, mpi_comm_rank);
+//         if (!entry) { 
+//             entry = malloc(sizeof(ipc_handle_cache_entry_t));
+//         if (!entry) { 
+//             mp_err_msg("cache entry allocation failed \n");	
+//             ret = MP_FAILURE;
+//             goto out;
+//         }
+	  
+//           CU_CHECK(cuMemGetAddressRange((CUdeviceptr *)&entry->base, &entry->size, (CUdeviceptr) buf));
+//           CU_CHECK(cuIpcGetMemHandle (&entry->handle, (CUdeviceptr)entry->base));
+
+//           ipc_handle_cache_insert(entry, mpi_comm_rank);
+//       }
+
+//         assert(entry != NULL);
+//         smp_buffer = client->smp.remote_buffer + client->smp.remote_head;
+//         assert(smp_buffer->free == 1);	
+
+//         memcpy((void *)&smp_buffer->handle, (void *)&entry->handle, sizeof(CUipcMemHandle));  
+//         smp_buffer->base_addr = entry->base;
+//         smp_buffer->base_size = entry->size;
+//         smp_buffer->addr = buf;
+//         smp_buffer->size = size;
+//         smp_buffer->offset = (uintptr_t)buf - (uintptr_t)entry->base;
+//         smp_buffer->sreq = req; 
+//         smp_buffer->free = 0; 
+//         smp_buffer->busy = 1;
+//         client->smp.remote_head = (client->smp.remote_head + 1)%smp_depth;	 
+//     }
+//     else
+//     {
+//         req->in.sr.next = NULL;
+//         req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+//         req->in.sr.exp_opcode = IBV_EXP_WR_SEND;
+//         req->in.sr.wr_id = (uintptr_t) req;
+//         req->in.sr.num_sge = 1;
+//         req->in.sr.sg_list = &req->sg_entry;
+
+//         if (mp_enable_ud) {
+//             req->in.sr.wr.ud.ah = client->ah;
+//             req->in.sr.wr.ud.remote_qpn = client->qpn; 
+//             req->in.sr.wr.ud.remote_qkey = 0;
+//         }
+
+//         req->sg_entry.length = size;
+//         req->sg_entry.lkey = reg->key;
+//         req->sg_entry.addr = (uintptr_t)(buf);
+//         // progress (remove) some request on the TX flow if is not possible to queue a send request
+//         ret = mp_post_send(client, req);
+//         if (ret) {
+//         mp_err_msg("posting send failed: %s \n", strerror(errno));
+//         goto out;
+//         }
+
+//         if (!use_event_sync) {
+//             ret = gds_prepare_wait_cq(client->send_cq, &req->gds_wait_info, 0);
+//             if (ret) {
+//                 mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
+//                 goto out;
+//             }
+//         }
+//     }
+
+//     *req_t = user_req;
+
+// out:
+//     return ret;
+// }
+
 int mp_isend (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_t)
 {
     int ret = 0;
@@ -1787,6 +1984,8 @@ int mp_isend (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_
     struct mp_request *req;
     struct mp_user_request *user_req = NULL;
     struct mp_reg *reg = (struct mp_reg *) *reg_t;
+    struct ibv_exp_tmh *tmh = NULL;
+    struct mp_reg *tmh_reg = NULL;
 
     client_t *client = &clients[client_index[peer]];
 
@@ -1797,73 +1996,49 @@ int mp_isend (void *buf, int size, int peer, mp_reg_t *reg_t, mp_request_t *req_
 
     mp_dbg_msg("req=%p id=%d\n", req, req->id);
 
-    if (mp_enable_ipc && client->can_use_ipc)
-    {
-        ipc_handle_cache_entry_t *entry = NULL;
-        smp_buffer_t *smp_buffer = NULL;
-
-        //try to find in local handle cache
-        ipc_handle_cache_find (buf, size, &entry, mpi_comm_rank);
-        if (!entry) { 
-            entry = malloc(sizeof(ipc_handle_cache_entry_t));
-        if (!entry) { 
-            mp_err_msg("cache entry allocation failed \n");	
-            ret = MP_FAILURE;
-            goto out;
-        }
-	  
-          CU_CHECK(cuMemGetAddressRange((CUdeviceptr *)&entry->base, &entry->size, (CUdeviceptr) buf));
-          CU_CHECK(cuIpcGetMemHandle (&entry->handle, (CUdeviceptr)entry->base));
-
-          ipc_handle_cache_insert(entry, mpi_comm_rank);
-      }
-
-        assert(entry != NULL);
-        smp_buffer = client->smp.remote_buffer + client->smp.remote_head;
-        assert(smp_buffer->free == 1);	
-
-        memcpy((void *)&smp_buffer->handle, (void *)&entry->handle, sizeof(CUipcMemHandle));  
-        smp_buffer->base_addr = entry->base;
-        smp_buffer->base_size = entry->size;
-        smp_buffer->addr = buf;
-        smp_buffer->size = size;
-        smp_buffer->offset = (uintptr_t)buf - (uintptr_t)entry->base;
-        smp_buffer->sreq = req; 
-        smp_buffer->free = 0; 
-        smp_buffer->busy = 1;
-        client->smp.remote_head = (client->smp.remote_head + 1)%smp_depth;	 
-    }
-    else
-    {
-        req->in.sr.next = NULL;
-        req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
-        req->in.sr.exp_opcode = IBV_EXP_WR_SEND;
-        req->in.sr.wr_id = (uintptr_t) req;
-        req->in.sr.num_sge = 1;
-        req->in.sr.sg_list = &req->sg_entry;
-
-        if (mp_enable_ud) {
-            req->in.sr.wr.ud.ah = client->ah;
-            req->in.sr.wr.ud.remote_qpn = client->qpn; 
-            req->in.sr.wr.ud.remote_qkey = 0;
-        }
-
-        req->sg_entry.length = size;
-        req->sg_entry.lkey = reg->key;
-        req->sg_entry.addr = (uintptr_t)(buf);
-        // progress (remove) some request on the TX flow if is not possible to queue a send request
-        ret = mp_post_send(client, req);
-        if (ret) {
-        mp_err_msg("posting send failed: %s \n", strerror(errno));
+    tmh = (struct ibv_exp_tmh *) malloc(sizeof(struct ibv_exp_tmh));
+    if (!tmh) {
+        mp_err_msg("cannot allocate memory\n");
+        ret = ENOMEM;
         goto out;
-        }
+    }
 
-        if (!use_event_sync) {
-            ret = gds_prepare_wait_cq(client->send_cq, &req->gds_wait_info, 0);
-            if (ret) {
-                mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
-                goto out;
-            }
+    ret = mp_register(tmh, sizeof(struct ibv_exp_tmh), &tmh_reg);
+    if (ret) {
+        mp_err_msg("mp_register failed\n");
+        goto out;
+    }
+
+    tmh->opcode = IBV_EXP_TMH_EAGER;
+    // tmh->opcode = IBV_EXP_TMH_NO_TAG;
+    tmh->tag = htobe64(42);
+    req->tmh_reg = tmh_reg;
+
+    req->in.sr.next = NULL;
+    req->in.sr.exp_send_flags = IBV_EXP_SEND_SIGNALED;
+    req->in.sr.exp_opcode = IBV_EXP_WR_SEND;
+    req->in.sr.wr_id = (uintptr_t) req;
+    req->in.sr.num_sge = 2;
+    req->in.sr.sg_list = req->tag_sg_entry;
+
+    req->tag_sg_entry[0].length = sizeof(struct ibv_exp_tmh);
+    req->tag_sg_entry[0].lkey = tmh_reg->key;
+    req->tag_sg_entry[0].addr = (uintptr_t)(tmh);
+    req->tag_sg_entry[1].length = size;
+    req->tag_sg_entry[1].lkey = reg->key;
+    req->tag_sg_entry[1].addr = (uintptr_t)(buf);
+    // progress (remove) some request on the TX flow if is not possible to queue a send request
+    ret = mp_post_send(client, req);
+    if (ret) {
+    mp_err_msg("posting send failed: %s \n", strerror(errno));
+    goto out;
+    }
+
+    if (!use_event_sync) {
+        ret = gds_prepare_wait_cq(client->send_cq, &req->gds_wait_info, 0);
+        if (ret) {
+            mp_err_msg("gds_prepare_wait_cq failed: %s \n", strerror(errno));
+            goto out;
         }
     }
 
@@ -2020,30 +2195,30 @@ struct mp_user_request *new_user_request(struct mp_request *internal_req) {
     user_req->internal_req = internal_req;
     internal_req->user_req = user_req;
     user_req->type = internal_req->type;
-    user_req->completed_host = false;
-    ret = pthread_mutex_init(&user_req->mutex, NULL);
-    if (ret) {
-        mp_err_msg("pthread_mutex_init returned error %d\n", ret);
-        return NULL;
-    }
-    ret = pthread_cond_init(&user_req->cond, NULL);
-    if (ret) {
-        mp_err_msg("pthread_cond_init returned error %d\n", ret);
-        return NULL;
-    }
-    if (user_req->type == MP_RECV) {
-        ret = pthread_mutex_lock(&client->tag_recv_user_reqs_mutex);
-        if (ret) {
-            mp_err_msg("pthread_mutex_lock return error %d\n", ret);
-            return NULL;
-        }
-        TAILQ_INSERT_TAIL(&client->tag_recv_user_reqs, user_req, entries);
-        ret = pthread_mutex_unlock(&client->tag_recv_user_reqs_mutex);
-        if (ret) {
-            mp_err_msg("pthread_mutex_unlock return error %d\n", ret);
-            return NULL;
-        }
-    }
+    // user_req->completed_host = false;
+    // ret = pthread_mutex_init(&user_req->mutex, NULL);
+    // if (ret) {
+    //     mp_err_msg("pthread_mutex_init returned error %d\n", ret);
+    //     return NULL;
+    // }
+    // ret = pthread_cond_init(&user_req->cond, NULL);
+    // if (ret) {
+    //     mp_err_msg("pthread_cond_init returned error %d\n", ret);
+    //     return NULL;
+    // }
+    // if (user_req->type == MP_RECV) {
+    //     ret = pthread_mutex_lock(&client->tag_recv_user_reqs_mutex);
+    //     if (ret) {
+    //         mp_err_msg("pthread_mutex_lock return error %d\n", ret);
+    //         return NULL;
+    //     }
+    //     TAILQ_INSERT_TAIL(&client->tag_recv_user_reqs, user_req, entries);
+    //     ret = pthread_mutex_unlock(&client->tag_recv_user_reqs_mutex);
+    //     if (ret) {
+    //         mp_err_msg("pthread_mutex_unlock return error %d\n", ret);
+    //         return NULL;
+    //     }
+    // }
     return user_req;
 }
 
@@ -2056,32 +2231,34 @@ void release_mp_request(struct mp_request *req)
 
   /* tag */
   int ret;
-  assert(req->tag_reg);
-  ret = mp_deregister(&req->tag_reg);
-  assert(!ret);
-  free((void *) req->tag_sg_entry[0].addr);
-  if (req->type == MP_RECV) {
-      assert(req->tmp_reg);
-    //   mp_info_msg("tmp_buf unreg address: %p\n", req->tmp_reg);
-      ret = mp_deregister(&req->tmp_reg);
-      assert(!ret);
-    //   mp_info_msg("tmp_buf free address: %p\n", (void *) req->tag_sg_entry[1].addr);
-      CUDA_CHECK(cudaFree((void *) req->tag_sg_entry[1].addr));
+  if (req->type == MP_SEND) {
+        assert(req->tmh_reg);
+        ret = mp_deregister(&req->tmh_reg);
+        assert(!ret);
+        free((void *) req->tag_sg_entry[0].addr);
   }
+//   if (req->type == MP_RECV) {
+//       assert(req->tmp_reg);
+//     //   mp_info_msg("tmp_buf unreg address: %p\n", req->tmp_reg);
+//       ret = mp_deregister(&req->tmp_reg);
+//       assert(!ret);
+//     //   mp_info_msg("tmp_buf free address: %p\n", (void *) req->tag_sg_entry[1].addr);
+//       CUDA_CHECK(cudaFree((void *) req->tag_sg_entry[1].addr));
+//   }
 
   mp_request_free_list = req;
 }
 
 void release_mp_user_request(struct mp_user_request *req)
 {
-    int ret;
-    ret = pthread_mutex_destroy(&req->mutex);
-    assert(!ret);
-    ret = pthread_cond_destroy(&req->cond);
-    assert(!ret);
-    if (req->type == MP_RECV) {
-        CUDA_CHECK(cudaFree((void *) req->completed_device));
-    }
+    // int ret;
+    // ret = pthread_mutex_destroy(&req->mutex);
+    // assert(!ret);
+    // ret = pthread_cond_destroy(&req->cond);
+    // assert(!ret);
+    // if (req->type == MP_RECV) {
+    //     CUDA_CHECK(cudaFree((void *) req->completed_device));
+    // }
     free(req);
 }
 

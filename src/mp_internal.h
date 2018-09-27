@@ -66,7 +66,8 @@ typedef enum mp_req_type {
 typedef struct {
     uint16_t lid;
     uint32_t psn;
-    uint32_t qpn;
+    uint32_t send_qpn;
+    uint32_t recv_qpn;
 } qpinfo_t;
 
 typedef enum mp_flow {
@@ -120,13 +121,13 @@ struct mp_request {
    struct CUstream_st *stream;
    union
    {
-       struct ibv_recv_wr rr;
+       struct ibv_exp_ops_wr rr;
        gds_send_wr sr;
    } in;
    union
    {
        gds_send_wr* bad_sr;
-       struct ibv_recv_wr* bad_rr;
+       struct ibv_exp_ops_wr* bad_rr;
    } out;
    struct ibv_sge sg_entry;
    struct ibv_sge ud_sg_entry[2];
@@ -136,7 +137,8 @@ struct mp_request {
    struct mp_request *next;
    struct mp_request *prev;
    /* tag related */
-   mp_reg_t tag_reg;
+   struct ibv_exp_tmh *tmh;
+   mp_reg_t tmh_reg;
    mp_reg_t tmp_reg;
    struct ibv_sge tag_sg_entry[2];
    struct mp_user_request *user_req;
@@ -394,13 +396,32 @@ static int mp_query_print_qp(struct gds_qp *qp, struct mp_request *req, int asyn
     memset(&qp_attr, 0, sizeof(struct ibv_qp_attr));
 
 
-    if (ibv_query_qp(qp->qp, &qp_attr, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_CAP, &qp_init_attr))
+    if (ibv_query_qp(qp->send_qp, &qp_attr, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_CAP, &qp_init_attr))
     {
         mp_err_msg("client query qp attr fail\n");
         return MP_FAILURE;
     }
    
-    mp_warn_msg("Init QP attr: max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d, qp_type=%d\nCurrent QP attr: QP State=%d QP Cur State=%d Access Flags=%d max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d\n",
+    mp_warn_msg("Init send QP attr: max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d, qp_type=%d\nCurrent QP attr: QP State=%d QP Cur State=%d Access Flags=%d max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d\n",
+                    qp_init_attr.cap.max_send_wr,
+                    qp_init_attr.cap.max_recv_wr,
+                    qp_init_attr.cap.max_inline_data,
+                    qp_init_attr.qp_type,
+                    qp_attr.qp_state,
+                    qp_attr.cur_qp_state,
+                    qp_attr.qp_access_flags,
+                    qp_attr.cap.max_send_wr,
+                    qp_attr.cap.max_recv_wr,
+                    qp_attr.cap.max_inline_data
+    );
+
+    if (ibv_query_qp(qp->recv_qp, &qp_attr, IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_CAP, &qp_init_attr))
+    {
+        mp_err_msg("client query qp attr fail\n");
+        return MP_FAILURE;
+    }
+   
+    mp_warn_msg("Init recv QP attr: max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d, qp_type=%d\nCurrent QP attr: QP State=%d QP Cur State=%d Access Flags=%d max_send_wr=%d, max_recv_wr=%d, max_inline_data=%d\n",
                     qp_init_attr.cap.max_send_wr,
                     qp_init_attr.cap.max_recv_wr,
                     qp_init_attr.cap.max_inline_data,
